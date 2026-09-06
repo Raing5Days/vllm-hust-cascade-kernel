@@ -201,4 +201,4 @@ merged = torch.ops.npu.lse_merge(o1, o2.squeeze(2), l1, l2.reshape(B * H))
 | 生产消费者（插件） | `vllm-ascend-split-batch-hust/src/vllm_ascend_split_batch/cascade_{plugin,graph_plugin,runner_patch,gate,gate_self}.py` |
 | 测量报告 | `cascade-c3-results/probes/W0-B2-适配测量报告.md`（B2 适配）、`W1-stageB-报告.md`（融合线 NO-GO 依据） |
 | 知识库 | `资料/flashinfer-移植知识库/02-本地对照面.md`（自研算子与 CANN FIA 事实条目） |
-| 多人协作/新算子流程 | `docs/multi-operator-dev.md` |
+| 多人协作/新算子流程 | `../docs/multi-operator-dev.md` |
