@@ -1,0 +1,17 @@
+# build artifacts
+ascend-kernel/build/
+ascend-kernel/output/
+ascend-kernel/dist/
+ascend-kernel/python/ascend_kernel/build/
+ascend-kernel/python/ascend_kernel/ascend_kernel.egg-info/
+ascend-kernel/python/ascend_kernel/ascend_kernel/config.ini
+ascend-kernel/python/ascend_kernel/ascend_kernel/lib/
+__pycache__/
+*.pyc
+*.so
+
+# debug dumps (keep the README-anchored note files, ignore dump payloads)
+ascend-kernel/extra-info/data-dump/
+
+# local packaging
+dist/
