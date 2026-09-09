@@ -51,9 +51,16 @@ SOC_VERSION="${1:-Ascend910_9382}"
 
 
 ### Get Current CANN Toolkit Installation Path
-_CANN_TOOLKIT_INSTALL_PATH=$(cat /etc/Ascend/ascend_cann_install.info | grep "Toolkit_InstallPath" | awk -F'=' '{print $2}')
-source ${_CANN_TOOLKIT_INSTALL_PATH}/set_env.sh
-echo -e "\e[1;32mDetected CANN Toolkit Installation Path: ${_CANN_TOOLKIT_INSTALL_PATH}\e[0m"
+# Multi-CANN coexistence: if the caller already activated a CANN toolkit
+# (e.g. an independent 9.1 install via conda activate.d), keep it instead of
+# silently falling back to the version recorded in ascend_cann_install.info.
+if [ -z "${ASCEND_HOME_PATH:-}" ]; then
+    _CANN_TOOLKIT_INSTALL_PATH=$(cat /etc/Ascend/ascend_cann_install.info | grep "Toolkit_InstallPath" | awk -F'=' '{print $2}')
+    source ${_CANN_TOOLKIT_INSTALL_PATH}/set_env.sh
+    echo -e "\e[1;32mDetected CANN Toolkit Installation Path: ${_CANN_TOOLKIT_INSTALL_PATH}\e[0m"
+else
+    echo -e "\e[1;32mUsing pre-activated CANN Toolkit: ${ASCEND_HOME_PATH}\e[0m"
+fi
 echo -e "\e[1;33mDouble Checking Environment Variables:\e[0m"
 echo -e "\e[1;32mASCEND_HOME_PATH: ${ASCEND_HOME_PATH}\e[0m"
 echo -e "\e[1;32mASCEND_TOOLKIT_HOME: ${ASCEND_TOOLKIT_HOME}\e[0m"
