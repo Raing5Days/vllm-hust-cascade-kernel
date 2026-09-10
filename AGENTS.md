@@ -5,7 +5,7 @@
 | 简称 | 内容 | 本地路径 | 远端 |
 |---|---|---|---|
 | **插件库** | vllm-ascend-split-batch-hust(唯一对外交付面:bundle/manifest、vllm-hust-ext 受管) | `/vllm-workspace/vllm-ascend-split-batch-hust` | `vLLM-HUST/vllm-ascend-split-batch-hust` |
-| **算子库**(本仓库) | cascade CCE 算子工程 + S1 锚点数据(wheel 工厂) | `/vllm-workspace/cascade-merge-op` | `Raing5Days/vllm-hust-cascade-kernel` |
+| **算子库**(本仓库) | cascade CCE 算子工程 + S1 锚点数据(wheel 工厂) | `/vllm-workspace/ops/kernels` | `Raing5Days/vllm-hust-cascade-kernel` |
 
 **逻辑关系:插件库 ⊃ 算子库**。插件库通过 `kernels` extra 钉版消费本仓库
 的 wheel,单向依赖;本仓库对 vllm-hust-ext、宿主、插件机制零感知。
@@ -29,7 +29,7 @@
 ## 常用命令
 
 ```bash
-cd /vllm-workspace/cascade-merge-op/ascend-kernel
+cd /vllm-workspace/ops/kernels/ascend-kernel
 ./build.sh                                                    # 全量重编 + 出 wheel 到 output/
 python csrc/ops/fa_fp32_stage1/test/test_fa_fp32_stage1_smoke.py    # S1 锚点
 python csrc/ops/fa_fp32_stage1/test/run_precision_suite.py          # 精度 30/30
