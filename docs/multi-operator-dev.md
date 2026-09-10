@@ -67,9 +67,9 @@
 
 | 算子/共享面 | Owner |
 |---|---|
-| `fa_fp32_stage1` | *(填写)* |
-| `lse_merge` | *(填写)* |
-| `register.cpp` / 构建链 | *(填写)* |
+| `fa_fp32_stage1` | 吴天宇 |
+| `lse_merge` | 吴天宇 |
+| `register.cpp` / 构建链 | 吴天宇 |
 
 - **NPU 是共享资源**(当前仅 1 卡可见):大 bench / 长占用前在群里打招呼;
   micro-bench 一律分组进程(同进程 FIA 危害见 README §4/§5);
