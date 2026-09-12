@@ -230,9 +230,14 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | merge 抑制因子 | 0.069 ≈ 理论 w2=0.059 | Tier1 数值主张直接证据 |
 | S1 bit 锚点 | O/LSE 逐 bit 相等（example 二进制） | q_len=1 域 |
 | e2e（插件两段式 + gate） | 8k 段 −6.6%~−28%；16k 段 −21%~−38%；4k×B64 亏 ~31%（gate 自动回落） | 9/9 格 × 两轮，Qwen2.5-Coder-14B 替身 |
-| add_rms_norm_stats @M=2048,K=5120（F2 norm 段三 mode，bf16） | mode0 157.8 / mode1 153.1 / mode2 151.1µs；oracle `npu_add_rms_norm` 156.5µs | 910B2/CANN 9.1.0，warmup 20 + 100 次中位 × 3 轮 host wall，卡 7 + `flock /tmp/w3-npu.lock` |
+| add_rms_norm_stats @M=2048,K=5120（F2 norm 段三 mode，bf16，**F2 冻结构建 `2026.9.12`**） | mode0 157.8 / mode1 153.1 / mode2 151.1µs；oracle `npu_add_rms_norm` 156.5µs | 910B2/CANN 9.1.0，warmup 20 + 100 次中位 × 3 轮 host wall，卡 7 + `flock /tmp/w3-npu.lock` |
+| add_rms_norm_stats @同 shape（**D3 构建 `2026.9.12.post1`**，硬化的 batch+pair+Newton2） | host wall：mode0 147.3 / mode1 153.7 / mode2 134.8µs；oracle 144.2µs（同法同轮次，卡 7 空闲 HBM 5%） | 同上口径；**设备时长**以 profiler 为准（§9.2/§9.4），host wall 含 ~65–116µs 固定开销，二者不可混比 |
 | **F2 gate ② 投影**（norm→GEMM 融合，判据式 design.md §4 实测前冻结） | A **−0.045%** / B''' 0.127% / B'' **0.200%** prefill | <1% ⇒ 按预注册规则**诚实关闭** A 变体；B 系上界一并上报 |
-| F2 结论：norm 段是**读带宽受限** | 有效带宽 ≈ 565GB/s（2×20.97MB / 74.25µs）；mode2 比 oracle 只快 3.5%（5.45µs/对） | 融合收益被带宽地板锁在 ~0.2% ⇒ 任何 norm→GEMM 拓扑都过不了 1% |
+| F2 结论：norm 段"读带宽受限 565GB/s" | ⚠ **已由 D3 更正**：565 是 `wall − c` 反推值，不是实测；profiler 实测设备时长 54.45µs（mode0）/56.39µs（mode2）⇒ mode2 真实读带宽 **743GB/s**，且**瓶颈不是带宽**而是 VEC+scalar 指令（见下两行） | 该行原判定"融合收益被带宽地板锁在 ~0.2%"的**结论仍成立**（F2 判据式等价于 wall 直比，c 相消），但**内因解释作废** |
+| **D3 剖因**（`torch_npu.profiler` 硬件时长 + 逐 pipe 占用，主 shape M=2048/K=5120 bf16） | mode0 54.45µs：**vec 0.629 / scalar 0.367** / mte2 0.217 / mte3 0.167；mode1 50.66µs（vec 0.789）；mode2 56.39µs（vec 0.635）。**同 62.91MB 的 CANN `aclnnAdd` 只需 17.54µs** ⇒ **3.13x 结构性头寸**，且 mte2 仅占 0.22（搬得动） | 归因：每行 17 条向量指令里 **10 条只服务 1 个标量**（Rsqrt+Newton 链 9 条 count-1 + 1 个 V→S barrier），且行间**无预取**（深度 2 队列未跨行流水） |
+| **D3 改动（已硬化为唯一行为）** | ① rstd 链批量化到每 `RSTD_GROUP=8` 行一次（元素级等价，仅调度）→ mode0 **−11.9%**（54.45→47.96µs）、mode2 −11.6%；② 行和**二分折叠** + **第二次 Newton**（精度，见下） | 变体原始数据 `profiles/qwen14b-instruct-hotspot-20260910/f2-kernel/raw/d3_*`；开关式 A/B 已删除，host 常量 `kBatchStats/kPairSum` |
+| **D3 gate 判定** | ① **通过**（标准档位 64/64 + 48/48）；② **不过** ⇒ 按预注册规则**关闭归档** | ② 最好读带宽 874GB/s（mode0,batch）/<1.0TB/s；交付配置 806/788GB/s；折算 pass 0.30%~0.54%（同口径设备时长差）**全部 <1%** |
+| **D3 精度修复（mode-1 `y`）** | CANN 严档位越界 **5/16 → 0/16**（控制组 CANN 0/16）；标准档位 64/64 + 48/48 不变；设备套件 46/46 | 根因拆两层：① 行和顺序合并 ≈30 eps（二分折叠修）；② 向量 `Rsqrt` ~2^-11 近似 × 一次 Newton 残留 ~1.5ε²（第二次 Newton 修）——**实测定位**：行和做准后越界元素的 rstd 相对差几乎不动（−3.389e-6→−3.450e-6） |
 | add_rms_norm_stats 精度（**容差按 ops-precision-standard**） | 64/64（vs CPU fp64 参考）+ 48/48（vs CANN oracle）；`matched_ratio` 全 1.0、`max_abs_error` 仅用掉上限 3.9% | 判据 = 该 skill 的混合容差 + `matched_ratio ≥ 0.99`；档位表逐字复制并有 CPU 用例对拍其 checker |
 | add_rms_norm_stats 残余差距（严档位诊断列） | CANN 自带用例更严档位（2^-7/2^-10，全元素）下 mode-1 `y` 12 行 × 1–20 元素越档 | 根因 = 行内平方和归约 ≈30 eps（CANN 0.5 eps）翻转 `mid` 舍入边界；修法（补偿求和/分段树）已定位未实施 |
 | add_rms_norm_stats 精度（CANN 严档位，**诊断列**） | 同批数据改用 CANN 自带用例档位（2^-7/2^-10，全元素）时对照 fp64 参考 52/64、CANN oracle 42/48；失败全在 mode-1 `y`、每例 1–20 元素 | 不参与判定（判定用上一行）；保留它使"与现役算子的边际距离"可复判，见 test-cases.md §3.2/§3.3 |
@@ -246,6 +251,9 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | fa_fp32_stage1 回归脚本 | `test/test_fa_fp32_stage1_smoke.py`（S1 锚点）、`run_precision_suite.py`（30/30）、`test_q_seqlen_fastpath.py`、`test_lse_flatten_regression.py` |
 | lse_merge 设计 / 用例 | `csrc/ops/lse_merge/design.md` / `test/lse_merge-test-cases.md` |
 | add_rms_norm_stats 设计（F2 融合选型 + 预注册 gate ② 判据式） | `csrc/ops/add_rms_norm_stats/design.md` |
+| add_rms_norm_stats D3（读带宽立项）：剖因 + 变体 + 判据 | `csrc/ops/add_rms_norm_stats/design.md` §9 |
+| add_rms_norm_stats IO 归因工具（profiler pipe 表 + wall/pipelined 扫描） | `csrc/ops/add_rms_norm_stats/test/run_io_profile.py`、`parse_kernel_pipe_csv.py`（用法见文件头） |
+| add_rms_norm_stats 行和累加深度 CPU 研究（校准到实测） | `csrc/ops/add_rms_norm_stats/test/run_sum_accuracy_study.py` |
 | add_rms_norm_stats 用例与判据 / 精度报告 / S1 锚点脚本 | `csrc/ops/add_rms_norm_stats/test/add_rms_norm_stats-test-cases.md`（§3 判据（容差按 ops-precision-standard）+ §3.1 判据实现缺陷 + §3.2 CANN 严档位下的 `y` 归约精度差距 + §3.3 标准档位复测） / `f2_prec.{json,md}`（标准档位运行）+ `f2_prec_r2_cann_tier.{json,md}`（严档位运行） / `run_s1_anchor.py` / `run_golden_selfcheck.py`（两档位 × 三种配对，含"判据是否可达"的控制实验） / `test_add_rms_norm_stats_ref.py`（CPU-only 判据守卫，含与 skill checker 的对拍） |
 | F2 立项与判定记录（画像侧） | `profiles/qwen14b-instruct-hotspot-20260910/f2-kernel/` |
 | 注册面 | `csrc/register.cpp`（torch.ops.npu schema） |
