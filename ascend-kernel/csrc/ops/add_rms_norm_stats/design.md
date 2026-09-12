@@ -469,7 +469,7 @@ F2 的 `t_exposed_device = wall − c`（`c = wall(oracle) − 79.70µs`）把 h
 逐项归因（对照理想差距）：
 1. **MTE2 粒度/队列深度**：每行一次 10KB `DataCopy`，且**在同一轮迭代内被消费**（Alloc→DataCopy
    →EnQue→DeQue 同轮）⇒ 深度 2 队列**没有形成跨行预取**；mte2 只占 22%，**搬得动**。
-   同字节 CANN elementwise 17.54µs 跑完 = **3.13x 头寸**。
+   同字节 CANN elementwise 17.54µs 跑完 = **3.10x 头寸**。
 2. **UB 分块**：整行驻留（K=5120），未做多行 tile（行在 GM 连续，本可一次搬 R 行）。
 3. **读写重叠**：mte2 0.22 与 mte3 0.17 之和远小于时间线，读写基本串在依赖链上。
 4. **cast/中间步占比**：每行 6 条整行 VEC 里 **4 条是 cast**（x1↑、x2↑、rint↓、back↑）；
