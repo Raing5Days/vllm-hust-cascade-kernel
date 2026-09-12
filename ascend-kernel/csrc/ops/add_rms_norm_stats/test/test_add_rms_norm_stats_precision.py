@@ -97,8 +97,11 @@ def test_negative_cases():
     _expect_reject(lambda: op(x1, x2[:, :64].contiguous(), gamma, None, 1e-6, 0),
                    "same shape")
     _expect_reject(lambda: op(x1, x2.to(torch.float16), gamma, None, 1e-6, 0), "same shape")
-    _expect_reject(lambda: op(torch.randn(m, 130, device=x1.device).to(torch.bfloat16), x2,
-                              gamma, None, 1e-6, 0), "multiple of 16")
+    # Both operands must break the same rule, otherwise the shape check fires first
+    # and the assertion would pass for the wrong reason (it did - caught by running
+    # the suite, not by reading it).
+    bad_k = torch.randn(m, 130, device=x1.device).to(torch.bfloat16)
+    _expect_reject(lambda: op(bad_k, bad_k, gamma, None, 1e-6, 0), "multiple of 16")
     _expect_reject(lambda: op(torch.randn(m, 6000, device=x1.device).to(torch.bfloat16),
                               torch.randn(m, 6000, device=x1.device).to(torch.bfloat16),
                               gamma, None, 1e-6, 0), "K must be in")
