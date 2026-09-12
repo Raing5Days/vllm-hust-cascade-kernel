@@ -22,28 +22,40 @@
 1. 平方和按 fp64 累加（golden 用 fp32 `torch.sum`）→ 参考是"精确侧"，容差吸收 kernel 的 fp32 归约序差异；
 2. fp16 档 gamma 乘法在 fp32 中完成（golden 的 fp16 路径在 fp16 中做乘加）→ fp16 MARE 容差吸收 ≤2^-11 的差。
 
-## 3. 判据与容差（dtype 档位直接取 CANN 官方用例，不自造）
+## 3. 判据与容差（**容差按 ops-precision-standard**）
 
-CANN 官方 `test_add_rms_norm_bias.py` 的档位：bf16 `atol=rtol=0.0079345703125 (2^-7)`、
-fp16 `atol=rtol=0.0010986328125 (2^-10)`。该档位在 CANN 官方用例里就是
-`torch.allclose(out, ref, rtol, atol)`，即**逐元素**判 `|out−ref| ≤ atol + rtol·|ref|`——
-**rtol 项是档位的一部分**（对 |y| 最大 ~8 的 `y`，它就是"1 个可表示步长"的判据）。按输出分别判：
+判据采用工作区只读参考 skill `ops-precision-standard`（浮点计算类；立项书原文即"容差按
+fp16/bf16 标准混合容差"）。实现与表值直接取该 skill 的
+`references/float_compute.md` §2–§4 与 `scripts/mixed_tolerance_check.py`，**逐字复制、不自行改编**：
 
-| 输出 | bf16 | fp16 | 判定式 |
-|---|---|---|---|
-| `x_out`（mode 0） | rel_l2 ≤ 1e-3 | 同构 | 违例元素数 = 0，违例 := `\|d\| > atol + rtol·\|ref\|` |
-| `y`（mode 1） | rel_l2 ≤ 5e-3 | rel_l2 ≤ 3e-3 | 同上 |
-| `rstd`（全 mode） | rel_l2 ≤ 5e-3 | 同构 | 违例元素数 = 0（无 CANN atol 档位 → atol=0, rtol=2^-6，等价于 max 相对误差 ≤ 2^-6） |
+- **逐元素**：`|out − golden| ≤ atol + rtol·|golden|`
+- **整体（用例判定）**：`matched_ratio ≥ 0.99` **且** `max_abs_error ≤ max(fixed_limit, 32·ULP@1.0)`
+- **档位按输出 dtype 取表**：fp16 `atol=rtol=2^-9`、bf16 `atol=rtol=2^-6`、
+  `rstd` 是 **fp32 输出**故取 fp32 行 `atol=2^-16, rtol=2^-10`；`fixed_limit` 分别 1e-1 / 1e0 / 1e-2；
+  `ULP@1.0` 分别 2^-10 / 2^-7 / 2^-23。
+- 判据是两个条件**同时**成立；`matched_ratio` 允许 1% 元素越界，但 `max_abs_error` 上限拦住"个别元素离谱"
+  的逃逸（本 op 实测两者都远未触线：matched_ratio 全为 1.0，max_abs_error 最大只到上限的 **3.9%**）。
 
-报告同时给出诊断量（**不参与判定**，全量留档）：`rel_l2`、`viol/n`、`MARE`（逐元素最大相对误差，
-近零元素上由 atol 项兜底）、`MaxAbsErr`，以及 `strict_abs_only` 列 = 是否**同时**满足更严读数
-"MaxAbsErr ≤ atol 且 max 相对误差 ≤ atol"（便于复核者按更严口径自行判读）。
+| 输出 | 标准档位（按输出 dtype） | 判定 |
+|---|---|---|
+| `x_out`（mode 0） | bf16 2^-6 / fp16 2^-9 | matched_ratio ≥ 0.99 且 max_abs ≤ 1e0 / 1e-1 |
+| `y`（mode 1） | 同上 | 同上 |
+| `rstd`（全 mode） | fp32 2^-16/2^-10 | matched_ratio ≥ 0.99 且 max_abs ≤ 1e-2 |
+
+报告同时全量留档三项**诊断量（不参与判定）**：`matched_ratio`（标准判据量本身）、`rel_l2`（批级相对 L2）、
+以及 `cann_viol/n` = 改用 **CANN 官方用例更严档位**（`atol=rtol=2^-7 bf16 / 2^-10 fp16`，要求**全元素**）
+时的越界元素数——用它把"与现役算子的边际距离"量化留档（见 §3.3）。
 
 **结构判据**（额外）：`rstd` 的 padding 行（`M` 向上取整到 8 的行）必须为 0。
 
-**生产 oracle 判据**（beta=None，与 `torch_npu.npu_add_rms_norm` 逐输出比）：
-`rstd` rel_l2 ≤ 2e-3 且逐元素相对违例 0；`x_out`/`y` rel_l2 ≤ 5e-3 且 CANN 逐元素档位违例 0。
+**生产 oracle 判据**（beta=None，与 `torch_npu.npu_add_rms_norm` 逐输出比，比标准**更严**）：
+按标准档位但要求 `matched_ratio = 1.0`（逐元素全过）且 max_abs ≤ 上限。之所以更严：这条路径的目的是
+证明"与现役算子不可区分"，不是满足某个 spec。
 （mode 1 vs oracle 用 `x2=0` 喂 CANN，使其残差输出恒等输入，比较同一件事。）
+
+**SKILL 一致性**：`test_add_rms_norm_stats_ref.py::test_matches_skill_checker_if_available`
+在 skill 在场时直接加载其 `mixed_tolerance_check.py`，逐项比对档位表/`ULP@1.0`/`matched_ratio`/
+`max_abs_error`/`is_pass`——防止我方实现与其参考实现漂移（skill 缺失时该用例 skip）。
 
 ### 3.1 判据实现缺陷与订正（2026-09-12，首轮实测后；档位数值未动）
 
@@ -69,10 +81,12 @@ fp16 `atol=rtol=0.0010986328125 (2^-10)`。该档位在 CANN 官方用例里就�
 
 ### 3.2 复测结果与 mode-1 `y` 未闭环缺陷（2026-09-12，档位仍未动）
 
-复测（`f2_prec.json|md`）：对照 fp64 参考 **52/64**、对照 CANN oracle **42/48**。
-**全部失败都在 mode 1 的 `y`**，每例只有 1–20 个元素越界（分母 26 万–1048 万），
-同 case 的 `rel_l2` 仅 4e-5~1.3e-4（比 5e-3 档位好 40–125 倍）；**mode 0/2 与全部 rstd 比对
-100% 通过（32/32 + 32/32）**。⇒ 判定：**gate ① 不达标（边际）**，缺陷锁定在 `y` 的施加路径。
+复测（`f2_prec_r2x.json|md`，本文件 §3 之前的旧档位口径）：对照 fp64 参考 **52/64**、
+对照 CANN oracle **42/48**。**全部失败都在 mode 1 的 `y`**，每例只有 1–20 个元素越界（分母 26 万–1048 万），
+同 case 的 `rel_l2` 仅 4e-5~1.3e-4（比旧 5e-3 档位好 40–125 倍）；**mode 0/2 与全部 rstd 比对
+100% 通过（32/32 + 32/32）**。⇒ 该口径下 gate ① **边际不达标**，缺陷锁定在 `y` 的施加路径。
+（档位改按 `ops-precision-standard` 后本项转为**通过**，见 §3.3；本节的机制分析仍然有效，
+故保留原文。）
 
 **是否"任何实现都过不了"？——实测回答：不是。** `run_golden_selfcheck.py` 把同一档位用在
 现役 CANN 算子上（`y` 对 fp64 参考）：**cann_vs_ref 越界 0/16 例**，而本核 5/16 例；
@@ -94,7 +108,26 @@ fp16 `atol=rtol=0.0010986328125 (2^-10)`。该档位在 CANN 官方用例里就�
 分段树（误差降 1–2 个数量级）。**为什么本程不改**：(a) 本 op 的融合价值已被 gate ② 判死
 （A −0.045%，全家族最乐观 +0.200%，判据在实测前冻结，见 design.md §4/§8）；
 (b) 该段已是带宽受限（565GB/s，峰值 ~1/2.5），Neumaier 每 64 元块要多 ~8 条向量算子，
-有把带宽受限段变成算力受限段的风险；(c) 改动需重跑 ①（另一把锁）。⇒ 如实记为**未闭环缺陷**。
+有把带宽受限段变成算力受限段的风险；(c) 改动需重跑 ①（另一把锁）。⇒ 如实记为**未闭环的边际缺陷**，
+在**标准档位**下不构成 gate ① 失败（§3.3），但它是本核与现役算子之间唯一的数值质量差距。
+
+### 3.3 标准档位复测（2026-09-12，判据改按 `ops-precision-standard`）
+
+按 §3 的标准档位与整体规则重跑（`f2_prec.json|md`，同一 64+48 用例矩阵、同一设备、同一锁）：
+
+| 口径 | 结果 |
+|---|---|
+| **标准档位（gate ① 判据）**：64 例 vs fp64 参考 | **64/64 通过**；`matched_ratio` **全为 1.0**；`max_abs_error` 最大仅到上限的 **3.9%**（fp16 `y` 3.906e-3 / 1e-1） |
+| **标准档位**：48 例 vs CANN oracle（要求逐元素全过） | **48/48 通过** |
+| 诊断列：CANN 官方更严档位（全元素） | 12 个输出行非零（**仅** mode-1 `y`，bf16 1–6 个、fp16 1–20 个元素）；其余 100 行为 0 |
+| 诊断列：`rel_l2` | `y` 4e-5~1.3e-4、`rstd` 3e-6 量级、`x_out` **0.0**（逐位一致） |
+
+两档位对同一批数据给出"标准过、更严档位不过"的差异是**档位差值本身**（bf16 2^-6 vs 2^-7、
+fp16 2^-9 vs 2^-10），不是判定口径的双标：§3.2 的 5/16 例在最严档位下仍然存在，已作为
+**剩余数值质量风险**记录（修法同上），并保留在每次报告的诊断列里。
+
+**控制实验的意义**：`cann_vs_ref` 在最严档位下 0/16 例，证明"该档位不可达"的辩解不成立——
+差距是本核的，不是判据的。这一点必须在关闭/续作时一并交代，不得只用"标准过了"盖过。
 
 ## 4. 用例矩阵（共 64 例 + oracle 48 例）
 

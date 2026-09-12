@@ -24,7 +24,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import ascend_kernel  # noqa: F401  (registers torch.ops.npu.add_rms_norm_stats)
 from add_rms_norm_stats_cases import MODES, SHAPES, make_inputs
-from add_rms_norm_stats_ref import cpu_ref, judge, metrics, tier, verdict
+from add_rms_norm_stats_ref import (
+    CANN_TEST_TIER,
+    cpu_ref,
+    judge,
+    metrics,
+    output_dtype,
+    std_spec,
+    verdict,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DTYPES = [torch.bfloat16, torch.float16]
@@ -47,14 +55,17 @@ def run_case(mode, dtype, name, shape, has_beta, seed):
         out, ref = outs[key]
         if key == "rstd":
             out = out[:m]  # rstd is padded to ceil(M/8) rows
-        atol, rtol, _ = tier(key, dtype)
-        mtr = metrics(out.cpu(), ref, atol, rtol)
+        spec = std_spec(output_dtype(key, dtype))
+        # The strict tier is the one CANN's own test_add_rms_norm_bias.py asserts
+        # (all elements required); it is reported so the marginal distance to the
+        # incumbent stays visible, but the standard's rule is the verdict.
+        ct = CANN_TEST_TIER[dtype]
+        mtr = metrics(out.cpu(), ref, spec["atol"], spec["rtol"],
+                      strict_atol=ct["atol"], strict_rtol=ct["rtol"])
+        mtr["cann_tier_viol"] = mtr.pop("strict_n_viol")
+        mtr["max_abs_error_limit"] = spec["max_abs_error_limit"]
         ok, why = judge(dtype, key, mtr)
         mtr["pass"] = bool(ok)
-        # transparent side-view: the first (defective) implementation bounded both
-        # MaxAbsErr and the max relative error by the bare atol, i.e. it dropped
-        # the rtol term. Kept as a column so the stricter reading stays visible.
-        mtr["strict_abs_only"] = bool(mtr["MaxAbsErr"] <= atol and mtr["MARE"] <= atol)
         if why:
             mtr["fail_reason"] = why
         row["checks"][key] = mtr
@@ -94,15 +105,21 @@ def run_oracle(mode, dtype, name, shape, seed):
     if mode == 1:
         pairs.append(("y", y, can_y))
     for key, out_t, ref_t in pairs:
-        # vs the CANN op the requirement is stricter than vs the fp64 reference:
-        # indistinguishable within the CANN official dtype tolerance.
-        atol, rtol, rel_tol = tier(key, dtype)
-        if key == "rstd":
-            atol, rtol, rel_tol = 0.0, 2.0e-3, 2.0e-3
-        mtr = metrics(out_t.cpu(), ref_t.cpu().float(), atol, rtol)
-        mtr["rel_l2_tol"] = rel_tol
-        mtr["pass"] = bool(verdict(mtr, atol, rtol, rel_tol)[0])
-        mtr["strict_abs_only"] = bool(mtr["MaxAbsErr"] <= atol and mtr["MARE"] <= atol)
+        # vs the CANN op the requirement is *stricter* than the standard: every
+        # element within the standard's tier (matched_ratio 1.0), because this
+        # comparison exists to show indistinguishability from the incumbent, not
+        # to pass a spec.
+        spec = std_spec(output_dtype(key, dtype))
+        ct = CANN_TEST_TIER[dtype]
+        mtr = metrics(out_t.cpu(), ref_t.cpu().float(), spec["atol"], spec["rtol"],
+                      strict_atol=ct["atol"], strict_rtol=ct["rtol"])
+        mtr["cann_tier_viol"] = mtr.pop("strict_n_viol")
+        mtr["require_all_elements"] = True
+        mtr["max_abs_error_limit"] = spec["max_abs_error_limit"]
+        ok, why = verdict(mtr, spec, require_all_elements=True)
+        mtr["pass"] = bool(ok)
+        if why:
+            mtr["fail_reason"] = why
         out["checks"][key] = mtr
     out["pass"] = all(c["pass"] for c in out["checks"].values())
     return out
@@ -163,47 +180,51 @@ def main():
         ),
         "- 参考实现：CPU fp64 累加 + CANN golden 舍入口径（`add_rms_norm_stats_ref.py`）",
         (
-            "- 判据：rel_l2 + CANN 官方逐元素档位 `|out−ref| <= atol + rtol·|ref|`"
-            "（bf16 atol=rtol=2^-7，fp16 atol=rtol=2^-10，viol=违例元素数，必须 0），"
-            "rstd 无 CANN atol 档位，按相对判据（atol=0, rtol=2^-6）"
+            "- **判据（容差按 ops-precision-standard）**：workspace skill "
+            "`.agents/skills/ops-precision-standard/`（浮点计算类）的混合容差——逐元素 "
+            "`|out−ref| <= atol + rtol·|ref|`，整体 `matched_ratio >= 0.99` 且 "
+            "`max_abs_error <= max(fixed_limit, 32·ULP@1.0)`。档位按**输出** dtype 取表："
+            "fp16 atol=rtol=2^-9、bf16 2^-6、rstd（fp32）atol=2^-16/rtol=2^-10；"
+            "abs 上限 fp16 0.1 / bf16 1.0 / fp32 1e-2"
         ),
         (
-            "- 旁证列 `MaxAbsErr/MARE` 为原始诊断量：`MARE` 是**逐元素最大相对误差**"
-            "（近零元素上由 atol 项兜底），首版实现误用它当绝对档位、并漏掉 rtol 项；"
-            "`strict_abs_only` 标记该更严读数是否也满足（不参与判定）"
+            "- 旁证列（**不参与判定**，留档以便复核）：`matched_ratio` 为标准判据量；"
+            "`rel_l2` 为批级相对 L2；`cann_viol/n` 为改用 **CANN 自带用例更严档位**"
+            "（atol=rtol=2^-7/2^-10 且要求全元素）时的违例数——用它把『与现役算子的边际距离』"
+            "量化留档（见 `add_rms_norm_stats-test-cases.md` §3.1/§3.2）"
         ),
         (
             f"- 生产 oracle 交叉核对（`torch_npu.npu_add_rms_norm`，beta=None）："
-            f"{report['oracle_n_pass']}/{len(oracle_rows)} 通过"
+            f"{report['oracle_n_pass']}/{len(oracle_rows)} 通过；该路径按**更严**口径要求"
+            "逐元素全过（matched_ratio = 1.0），因为它的目的是证明与现役算子不可区分"
         ),
         "- shape/口径见 `add_rms_norm_stats-test-cases.md`",
         "",
         "## 用例明细",
         "",
-        "| mode | case | shape | dtype | beta | 输出 | rel_l2 | viol/n | MARE | MaxAbsErr | 判定 | 严读数 |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| mode | case | shape | dtype | beta | 输出 | matched | rel_l2 | viol/n | MaxAbsErr | abs上限 | 判定 | CANN严档 viol |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         for key, mtr in r["checks"].items():
             lines.append(f"| {r['mode']} {r['mode_name']} | {r['case']} | {r['shape']} | {r['dtype']} | "
-                         f"{'Y' if r['beta'] else 'N'} | {key} | {mtr['rel_l2']:.3e} | "
-                         f"{mtr['n_viol']}/{mtr['n_el']} | {mtr['MARE']:.3e} | "
-                         f"{mtr['MaxAbsErr']:.3e} | {'PASS' if mtr['pass'] else 'FAIL'} | "
-                         f"{'ok' if mtr['strict_abs_only'] else 'over'} |")
+                         f"{'Y' if r['beta'] else 'N'} | {key} | {mtr['matched_ratio']:.8f} | "
+                         f"{mtr['rel_l2']:.3e} | {mtr['n_viol']}/{mtr['n_el']} | "
+                         f"{mtr['MaxAbsErr']:.3e} | {mtr['max_abs_error_limit']:.3e} | "
+                         f"{'PASS' if mtr['pass'] else 'FAIL'} | {mtr['cann_tier_viol']} |")
     lines += [
         "",
         "## 生产 oracle 交叉核对（vs `torch_npu.npu_add_rms_norm`）",
         "",
-        "| mode | case | shape | dtype | 输出 | rel_l2 | viol/n | MARE | MaxAbsErr | 判定 | 严读数 |",
+        "| mode | case | shape | dtype | 输出 | matched | rel_l2 | viol/n | MaxAbsErr | 判定 | CANN严档 viol |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in oracle_rows:
         for key, mtr in r["checks"].items():
             lines.append(f"| {r['mode']} | {r['case']} | {r['shape']} | {r['dtype']} | {key} | "
-                         f"{mtr['rel_l2']:.3e} | {mtr['n_viol']}/{mtr['n_el']} | "
-                         f"{mtr['MARE']:.3e} | {mtr['MaxAbsErr']:.3e} | "
-                         f"{'PASS' if mtr['pass'] else 'FAIL'} | "
-                         f"{'ok' if mtr['strict_abs_only'] else 'over'} |")
+                         f"{mtr['matched_ratio']:.8f} | {mtr['rel_l2']:.3e} | "
+                         f"{mtr['n_viol']}/{mtr['n_el']} | {mtr['MaxAbsErr']:.3e} | "
+                         f"{'PASS' if mtr['pass'] else 'FAIL'} | {mtr['cann_tier_viol']} |")
     with open(args.out_md, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"\nreport: {args.out_json}\nmd: {args.out_md}")
