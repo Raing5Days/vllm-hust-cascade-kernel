@@ -20,18 +20,22 @@ test-cases.md:
 """
 import torch
 
-# Judgement per output: rel_l2 (batch-level), MARE (max relative error, |ref|
-# domain) and MaxAbsErr, with tolerances taken from the CANN official test
-# (atol=rtol=2^-7 for bf16, 2^-10 for fp16) rather than invented here.
+# Judgement per output: rel_l2 (batch-level) plus the CANN official elementwise
+# criterion |out - ref| <= atol + rtol * |ref|, with the CANN dtype tier
+# (atol = rtol = 2^-7 for bf16, 2^-10 for fp16) rather than one invented here.
+# The tier is applied the way the CANN test uses it (torch.allclose(rtol, atol)):
+# the rtol term is the whole point of the tier for a tensor whose |y| reaches ~8,
+# where a bare 2^-7 absolute bound would be ~7x stricter than one bf16 ulp.
 TOL = {
-    torch.bfloat16: {"atol": 7.9345703125e-03, "mare": 7.9345703125e-03,
+    torch.bfloat16: {"atol": 7.9345703125e-03, "rtol": 7.9345703125e-03,
                      "rel_l2_round": 1.0e-03, "rel_l2_soft": 5.0e-03},
-    torch.float16: {"atol": 1.0986328125e-03, "mare": 1.0986328125e-03,
+    torch.float16: {"atol": 1.0986328125e-03, "rtol": 1.0986328125e-03,
                     "rel_l2_round": 1.0e-03, "rel_l2_soft": 3.0e-03},
 }
 # rstd is fp32 computed from the rounded residual; it has no CANN atol entry, so
-# it is judged relatively (fp32 reduction order is the only difference source).
-RSTD_TOL = {"mare": 2.0 ** -6, "rel_l2": 5.0e-03}
+# it is judged relatively (fp32 reduction order is the only difference source):
+# max relative error <= 2^-6, i.e. atol = 0, rtol = 2^-6 in the same form.
+RSTD_TOL = {"rtol": 2.0 ** -6, "rel_l2": 5.0e-03}
 
 
 def cpu_ref(x1, x2, gamma, beta, eps, mode):
@@ -56,12 +60,42 @@ def cpu_ref(x1, x2, gamma, beta, eps, mode):
     return x_out, rstd.float(), y
 
 
-def metrics(out, ref):
-    """MERE/MARE/MaxAbsErr/rel_l2 for one output tensor (ref is the exact side)."""
-    d = (out.double() - ref.double()).abs()
-    rel = d / (ref.double().abs() + 1e-7)
-    ref_l2 = ref.double().norm()
+def tier(name, x1_dtype):
+    """(atol, rtol, rel_l2_tol) of the declared criterion for one output.
+
+    `rstd` carries its own relative tier (no CANN atol entry); the dtype outputs
+    use the CANN official pair, whose rtol term must be kept - see TOL above.
+    """
+    if name == "rstd":
+        t = RSTD_TOL
+        return 0.0, t["rtol"], t["rel_l2"]
+    t = TOL[x1_dtype]
+    return t["atol"], t["rtol"], (t["rel_l2_round"] if name == "x_out" else t["rel_l2_soft"])
+
+
+def metrics(out, ref, atol=0.0, rtol=0.0):
+    """MERE/MARE/MaxAbsErr/rel_l2/violation count for one output (ref = exact side).
+
+    Both operands are flattened first and a differing element count is a hard
+    error: `rstd` is allocated as (M_padded, 1) while a reference may be (M,) or
+    (M, 1), and letting torch broadcast those two silently pairs every row with
+    every other row (a defect this helper must not be able to reproduce: the
+    inflated numbers then look like a real precision failure).
+    """
+    a = out.double().reshape(-1)
+    b = ref.double().reshape(-1)
+    if a.numel() != b.numel():
+        raise ValueError(
+            f"metrics: element count mismatch {a.numel()} vs {b.numel()} "
+            f"(shapes {tuple(out.shape)} vs {tuple(ref.shape)}) - refusing a broadcast compare")
+    d = (a - b).abs()
+    rel = d / (b.abs() + 1e-7)
+    ref_l2 = b.norm()
+    n_viol = int((d > (atol + rtol * b.abs())).sum().item())
     return {
+        "n_el": a.numel(),
+        "n_viol": n_viol,
+        "viol_frac": n_viol / a.numel(),
         "MERE": rel.mean().item(),
         "MARE": rel.max().item(),
         "MaxAbsErr": d.max().item(),
@@ -69,17 +103,17 @@ def metrics(out, ref):
     }
 
 
+def verdict(m, atol, rtol, rel_tol):
+    """Single implementation of the declared criterion (used by both suites)."""
+    ok = m["rel_l2"] <= rel_tol and m["n_viol"] == 0
+    reason = "" if ok else (
+        f"rel_l2 {m['rel_l2']:.3e}<={rel_tol:.1e}? viol {m['n_viol']}/{m['n_el']} "
+        f"(criterion |d|<=atol+rtol*|ref|, atol={atol:.3e}, rtol={rtol:.3e}; "
+        f"MaxAbsErr {m['MaxAbsErr']:.3e}, MARE {m['MARE']:.3e})?")
+    return ok, reason
+
+
 def judge(x1_dtype, name, m):
     """Applies the declared per-output criterion; returns (ok, reason)."""
-    t = TOL[x1_dtype]
-    if name == "rstd":
-        rel_tol = RSTD_TOL["rel_l2"]
-        mare_tol = RSTD_TOL["mare"]
-    else:
-        rel_tol = t["rel_l2_round"] if name == "x_out" else t["rel_l2_soft"]
-        mare_tol = t["mare"]
-    ok = m["rel_l2"] <= rel_tol and m["MARE"] <= mare_tol and m["MaxAbsErr"] <= t["atol"]
-    reason = "" if ok else (
-        f"rel_l2 {m['rel_l2']:.3e}<={rel_tol:.1e}? MARE {m['MARE']:.3e}<={mare_tol:.1e}? "
-        f"MaxAbsErr {m['MaxAbsErr']:.3e}<={t['atol']:.1e}?")
-    return ok, reason
+    atol, rtol, rel_tol = tier(name, x1_dtype)
+    return verdict(m, atol, rtol, rel_tol)

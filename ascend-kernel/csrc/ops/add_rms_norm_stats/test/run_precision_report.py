@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import ascend_kernel  # noqa: F401  (registers torch.ops.npu.add_rms_norm_stats)
 from add_rms_norm_stats_cases import MODES, SHAPES, make_inputs
-from add_rms_norm_stats_ref import TOL, cpu_ref, judge, metrics
+from add_rms_norm_stats_ref import cpu_ref, judge, metrics, tier, verdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DTYPES = [torch.bfloat16, torch.float16]
@@ -47,9 +47,14 @@ def run_case(mode, dtype, name, shape, has_beta, seed):
         out, ref = outs[key]
         if key == "rstd":
             out = out[:m]  # rstd is padded to ceil(M/8) rows
-        mtr = metrics(out.cpu(), ref)
+        atol, rtol, _ = tier(key, dtype)
+        mtr = metrics(out.cpu(), ref, atol, rtol)
         ok, why = judge(dtype, key, mtr)
         mtr["pass"] = bool(ok)
+        # transparent side-view: the first (defective) implementation bounded both
+        # MaxAbsErr and the max relative error by the bare atol, i.e. it dropped
+        # the rtol term. Kept as a column so the stricter reading stays visible.
+        mtr["strict_abs_only"] = bool(mtr["MaxAbsErr"] <= atol and mtr["MARE"] <= atol)
         if why:
             mtr["fail_reason"] = why
         row["checks"][key] = mtr
@@ -80,19 +85,24 @@ def run_oracle(mode, dtype, name, shape, seed):
     torch.npu.synchronize()
     out = {"mode": mode, "shape": f"{m}x{k}", "case": name,
            "dtype": str(dtype).replace("torch.", ""), "checks": {}}
+    # Both sides are flattened inside metrics(), so a (M, 1) rstd against a (M,)
+    # oracle cannot broadcast into an (M, M) pairing (that defect produced a
+    # spurious rel_l2 = 0.64 > MARE = 0.066, impossible for an aligned pair).
     pairs = [("rstd", rstd[:m], can_rstd.reshape(-1)[:m])]
     if mode == 0:
         pairs.append(("x_out", x_out, can_xo))
     if mode == 1:
         pairs.append(("y", y, can_y))
     for key, out_t, ref_t in pairs:
-        mtr = metrics(out_t.cpu(), ref_t.cpu().float())
         # vs the CANN op the requirement is stricter than vs the fp64 reference:
         # indistinguishable within the CANN official dtype tolerance.
-        t = TOL[dtype]
-        rel_tol = 2.0e-3 if key == "rstd" else t["rel_l2_soft"]
+        atol, rtol, rel_tol = tier(key, dtype)
+        if key == "rstd":
+            atol, rtol, rel_tol = 0.0, 2.0e-3, 2.0e-3
+        mtr = metrics(out_t.cpu(), ref_t.cpu().float(), atol, rtol)
         mtr["rel_l2_tol"] = rel_tol
-        mtr["pass"] = bool(mtr["rel_l2"] <= rel_tol and mtr["MaxAbsErr"] <= t["atol"])
+        mtr["pass"] = bool(verdict(mtr, atol, rtol, rel_tol)[0])
+        mtr["strict_abs_only"] = bool(mtr["MaxAbsErr"] <= atol and mtr["MARE"] <= atol)
         out["checks"][key] = mtr
     out["pass"] = all(c["pass"] for c in out["checks"].values())
     return out
@@ -153,8 +163,14 @@ def main():
         ),
         "- 参考实现：CPU fp64 累加 + CANN golden 舍入口径（`add_rms_norm_stats_ref.py`）",
         (
-            "- 判据：rel_l2 + MARE + MaxAbsErr，容差取 CANN 官方用例档位"
-            "（bf16 atol=rtol=2^-7，fp16 atol=rtol=2^-10），rstd 按相对判据（fp32 归约序差异）"
+            "- 判据：rel_l2 + CANN 官方逐元素档位 `|out−ref| <= atol + rtol·|ref|`"
+            "（bf16 atol=rtol=2^-7，fp16 atol=rtol=2^-10，viol=违例元素数，必须 0），"
+            "rstd 无 CANN atol 档位，按相对判据（atol=0, rtol=2^-6）"
+        ),
+        (
+            "- 旁证列 `MaxAbsErr/MARE` 为原始诊断量：`MARE` 是**逐元素最大相对误差**"
+            "（近零元素上由 atol 项兜底），首版实现误用它当绝对档位、并漏掉 rtol 项；"
+            "`strict_abs_only` 标记该更严读数是否也满足（不参与判定）"
         ),
         (
             f"- 生产 oracle 交叉核对（`torch_npu.npu_add_rms_norm`，beta=None）："
@@ -164,26 +180,30 @@ def main():
         "",
         "## 用例明细",
         "",
-        "| mode | case | shape | dtype | beta | 输出 | rel_l2 | MARE | MaxAbsErr | 判定 |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| mode | case | shape | dtype | beta | 输出 | rel_l2 | viol/n | MARE | MaxAbsErr | 判定 | 严读数 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         for key, mtr in r["checks"].items():
             lines.append(f"| {r['mode']} {r['mode_name']} | {r['case']} | {r['shape']} | {r['dtype']} | "
-                         f"{'Y' if r['beta'] else 'N'} | {key} | {mtr['rel_l2']:.3e} | {mtr['MARE']:.3e} | "
-                         f"{mtr['MaxAbsErr']:.3e} | {'PASS' if mtr['pass'] else 'FAIL'} |")
+                         f"{'Y' if r['beta'] else 'N'} | {key} | {mtr['rel_l2']:.3e} | "
+                         f"{mtr['n_viol']}/{mtr['n_el']} | {mtr['MARE']:.3e} | "
+                         f"{mtr['MaxAbsErr']:.3e} | {'PASS' if mtr['pass'] else 'FAIL'} | "
+                         f"{'ok' if mtr['strict_abs_only'] else 'over'} |")
     lines += [
         "",
         "## 生产 oracle 交叉核对（vs `torch_npu.npu_add_rms_norm`）",
         "",
-        "| mode | case | shape | dtype | 输出 | rel_l2 | MaxAbsErr | 判定 |",
-        "|---|---|---|---|---|---|---|---|",
+        "| mode | case | shape | dtype | 输出 | rel_l2 | viol/n | MARE | MaxAbsErr | 判定 | 严读数 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in oracle_rows:
         for key, mtr in r["checks"].items():
             lines.append(f"| {r['mode']} | {r['case']} | {r['shape']} | {r['dtype']} | {key} | "
-                         f"{mtr['rel_l2']:.3e} | {mtr['MaxAbsErr']:.3e} | "
-                         f"{'PASS' if mtr['pass'] else 'FAIL'} |")
+                         f"{mtr['rel_l2']:.3e} | {mtr['n_viol']}/{mtr['n_el']} | "
+                         f"{mtr['MARE']:.3e} | {mtr['MaxAbsErr']:.3e} | "
+                         f"{'PASS' if mtr['pass'] else 'FAIL'} | "
+                         f"{'ok' if mtr['strict_abs_only'] else 'over'} |")
     with open(args.out_md, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"\nreport: {args.out_json}\nmd: {args.out_md}")
