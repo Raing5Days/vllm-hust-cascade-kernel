@@ -213,6 +213,8 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | add_rms_norm_stats：`K > 5120` / `K % 16 != 0` / 两输入不同 dtype / mode∉{0,1,2} / fp32 输入 | TORCH_CHECK 拒（v1 整行 UB 驻留 + 32B 行拷贝约束） |
 | add_rms_norm_stats：AICore 无标量 `sqrtf`、且拒绝 `uint32→float` 强转 | 编译期即失败：1/K 由 host 传入、开方走向量 `Rsqrt`（勿在 kernel 里写 `sqrtf((float)kDim)`） |
 | add_rms_norm_stats：行数分组写 rstd | 每核 8 行（32B）一写；4B 单写挂（与 fa 的 LSE 行 32B padded 同源教训），`rstd` 因此按 `ceil(M/8)` 行分配 |
+| add_rms_norm_stats：`Rsqrt` 在 910B 上是 ~2^-11 近似 | 单用 `Rsqrt` 得到的 rstd 与 CANN 差 2.29e-3（已超 2^-7 档位）；kernel 内必须跟一次 Newton 细化（`r *= 1.5 − 0.5·a·r²`）才回到 ~2^-22（上板复验：1.13e-5） |
+| add_rms_norm_stats：`rstd` 输出是 **(ceil(M/8), 1)** 二维 | 与 `(M,)` 的一维参考直接相减会被 torch **静默广播**成 `(M,M)` 两两配对，产出假精度结论（曾报 `rel_l2 0.64` 而逐元素最大相对误差只 0.066——对齐时 `rel_l2 ≤ MARE` 恒成立，见 test-cases.md §3.1）；比对前先 flatten，`test/test_add_rms_norm_stats_ref.py` 已固化该守卫 |
 
 ## 6. 实测锚点（910B2 / CANN 9.0.1，2026-09）
 
@@ -225,6 +227,9 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | merge 抑制因子 | 0.069 ≈ 理论 w2=0.059 | Tier1 数值主张直接证据 |
 | S1 bit 锚点 | O/LSE 逐 bit 相等（example 二进制） | q_len=1 域 |
 | e2e（插件两段式 + gate） | 8k 段 −6.6%~−28%；16k 段 −21%~−38%；4k×B64 亏 ~31%（gate 自动回落） | 9/9 格 × 两轮，Qwen2.5-Coder-14B 替身 |
+| add_rms_norm_stats @M=2048,K=5120（F2 norm 段三 mode，bf16） | mode0 157.8 / mode1 153.1 / mode2 151.1µs；oracle `npu_add_rms_norm` 156.5µs | 910B2/CANN 9.1.0，warmup 20 + 100 次中位 × 3 轮 host wall，卡 7 + `flock /tmp/w3-npu.lock` |
+| **F2 gate ② 投影**（norm→GEMM 融合，判据式 design.md §4 实测前冻结） | A **−0.045%** / B''' 0.127% / B'' **0.200%** prefill | <1% ⇒ 按预注册规则**诚实关闭** A 变体；B 系上界一并上报 |
+| F2 结论：norm 段是**读带宽受限** | 有效带宽 ≈ 565GB/s（2×20.97MB / 74.25µs）；mode2 比 oracle 只快 3.5%（5.45µs/对） | 融合收益被带宽地板锁在 ~0.2% ⇒ 任何 norm→GEMM 拓扑都过不了 1% |
 
 ## 7. 文档与代码索引
 

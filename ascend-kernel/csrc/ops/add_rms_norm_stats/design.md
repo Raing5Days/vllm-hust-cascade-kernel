@@ -242,6 +242,13 @@ saved_us_per_pair = t_norm_device − t_exposed_device
     M=1、K=16384（行内二级切分上界）、beta=None / beta 非零两态、fp16/bf16 两 dtype。
 - 负例：非连续、dtype 不一致、K%16≠0、mode∉{0,1,2}、eps≤0 → 全部 `TORCH_CHECK` 拒。
 
+> **§6 补充（2026-09-12，首轮实测后；档位数值未改）**：上述 `atol=rtol=2^-7/2^-10` 档位在 CANN 官方
+> 用例里是 `torch.allclose`，即逐元素 `|out−ref| ≤ atol + rtol·|ref|`；**rtol 项属于档位本身**。
+> 首版实现把它当成"MaxAbsErr ≤ atol 且 max 相对误差 ≤ atol"的纯绝对界（对 |y|≤8 的 `y` 比 1 ulp 还严
+> ~7 倍），并把 `(M,1)` 的 rstd 与 `(M,)` 的 oracle 静默广播成 `(M,M)` 配对——两处都是**实现缺陷**，
+> 档位一个数没动。症状、数值吻合证据与订正见 `test/add_rms_norm_stats-test-cases.md` §3.1；
+> 报告同时保留更严读数（`strict_abs_only` 列）以便复核。`rel_l2` 上限本节未改。
+
 ## 7. S1 锚点方案（NPU）
 
 - 设备/卡：910B2（c220），CANN 9.1.0，torch_npu 2.13.0rc1；`flock /tmp/w3-npu.lock` 串行化，
@@ -260,27 +267,49 @@ saved_us_per_pair = t_norm_device − t_exposed_device
 
 > 本节由实测回填；§4 的公式与阈值在上述提交中已冻结。
 
-**状态（2026-09-12 06:57）：② 的实测未完成**——共享 NPU 被并行任务（`probe-combined-e2e/v2`,
-3 prefix × 2 batch × 3 round × 2 leg 的 serve+bench 网格）持续占用，本程的排队任务
-（`/tmp/f2_run_all3.sh`，`flock -w 21600 /tmp/w3-npu.lock`）在报告落盘时仍在等待锁。
-排队链一次锁内跑完：smoke → 精度套件（64 例 + 48 oracle）→ S1 锚点（bf16/fp16）→
-`/tmp/f2_finalize.sh`（把 raw 落进算子库 `test/` 与 `profiles/.../f2-kernel/raw/`，并提交）。
-**判定规则不因等待改变**：§4 的公式/阈值在实测前已冻结；`gate2_projection` 由
-`run_s1_anchor.py` 按 §4 现算并写进 JSON，回填时不得调整。
+**状态（2026-09-12 07:03，实测完成）：② 判定 = 不过。** A 变体投影 **−0.045%**（负收益），
+即使把 B 系一并算上，最乐观的 B''（mode 2）也只有 **+0.200%**，离 1% 门槛差 5 倍。
 
-已完成的**上板事实**（两次运行，见 §5.1）：
-- 首版：全核 `aivec error / UB address ... not aligned`（kernel retCode=0x31）→ 已定位并修复（标量 staging 写）；
-- 修复后 smoke（M=7/K=128/bf16，Newton 细化**之前**的构建）：mode 0 的 `x_out` 与 CANN
-  `npu_add_rms_norm` **逐位一致（maxabs=0.0）**，mode 1/2 正常返回，rstd 偏差 2.29e-3（Rsqrt 近似，
-  已加 Newton 细化修复，**该修复尚未上板复验**——同一 NPU 锁原因）。
+口径：卡 7，M=2048/K=5120（F2 主 shape），`warmup 20 + 100 次中位 × 3 轮`（每轮 sync），
+oracle/matmul/本 op 同进程同轮次；`flock /tmp/w3-npu.lock` 串行；卡 7 水位跑前/跑后均 HBM 5% / AICore 0%。
+raw：`test/f2_s1_bf16.json`、`test/f2_s1_fp16.json`（副本在 `profiles/.../f2-kernel/raw/`，
+其中 `run_all.log` 含 `=== gate-2 projections ===` 段）。`gate2_projection` 由 `run_s1_anchor.py`
+按 §4 现算写进 JSON，回填未做任何调整。
 
-**本程实测锚点（旁证，2026-09-12 卡 7，bf16，M=2048/K=5120，warmup 20 + 100 次中位 × 3 轮）**：
+dispatch 标定（同进程同 shape）：`c = t_wall(oracle) − 79.70µs` → bf16 **c = 76.83µs**（oracle wall 156.53µs）。
 
-| 项 | wall µs（best-of-3 中位） |
-|---|---|
-| `torch_npu.npu_add_rms_norm`（现役 AddRmsNormBias 的 C 面入口） | **142.9**（生产 profile 的设备时长 79.70µs ⇒ dispatch 标定 c ≈ 63.2µs） |
-| `aclcnnMatmul`（torch.matmul）K=5120 → N=7168 | **516.9**（profile：aclnnAddmm 505.45µs） |
-| `aclcnnMatmul` K=5120 → N=5120 | **398.4** |
+| 变体（= 本 op 的 mode） | wall 中位 µs（3 轮，best） | t_exposed_device µs | 每对省 µs | **② 投影（% prefill）** |
+|---|---|---|---|---|
+| **A** 后继 GEMM prologue（mode 0：残差加 + 统计） | 157.75 / 159.71 / 158.58 → **157.75** | **80.92** | **−1.22** | **−0.045** |
+| B''' 上游 epilogue + mode 1（统计 + 施加） | 153.07 / 153.68 / 154.33 → **153.07** | 76.24 | 3.46 | 0.127 |
+| B'' 上游 epilogue + mode 2（只统计） | 151.08 / 151.61 / 151.76 → **151.08** | 74.25 | 5.45 | **0.200** |
+| 对照 oracle `torch_npu.npu_add_rms_norm` | 157.11 / 157.21 / 156.53 → 156.53 | (79.70 = profile 锚点，标定用) | — | — |
+| 对照 `torch.matmul` K=5120→N=7168 | 533.93 / 529.82 / 531.42 → 529.82 | — | — | （profile aclnnAddmm 505.45µs） |
+| 对照 `torch.matmul` K=5120→N=5120 | 413.83 / 411.36 / 410.32 → 410.32 | — | — | — |
+
+**判定（按 §4 预注册规则，不改判据）**：`投影_prefill(A) = −0.045% < 1%` → **gate ② 不过**。
+连"prologue 白送"的最乐观假设都救不了：本 op 的 mode 0 设备耗时 80.92µs 已经**超过**现役算子
+同 shape 的 79.70µs（残差加 + 统计的算力就是那 4 份 20MB 读写的主力开销，写 y 的那一份不是）。
+§4 的否证性推理成立 → **无需再写融合 GEMM**，按预注册规则诚实关闭 A 变体。
+
+**为什么这么小（本程最有价值的一条实测事实）**：三种 mode 的 wall 落在 151–158µs 的窄带内，
+而现役 oracle 就 156.53µs——即 **norm 段是读带宽受限**：mode 2 相比 oracle 少写 x_out/y、又省掉
+施加计算，只快 5.45µs（3.5%）。任何"把 norm 融进邻接 GEMM"的拓扑收益都被这个带宽地板锁在
+**≤0.2%** 量级。此前按理想带宽（1.0–1.2TB/s）折出的 B''≈2.0–2.3% 高估了约 10 倍：
+**实测有效带宽 ≈ 2×20.97MB / 74.25µs ≈ 565GB/s**（理想值的 ~1/2.5）。
+- 附：decode（M=32，bf16，非判据，仅记录）：oracle 124.13 / mode0 122.44 / mode1 123.56 /
+  mode2 112.81 / matmul N7168 114.40 / N5120 98.55（µs，best-of-3 中位）。
+
+**fp16 一组（次口径，仅作对照，不作判据）**：`c = 39.11µs`（由 fp16 oracle wall 118.81µs 标定），
+得 A −0.99% / B''' −0.797% / B'' −0.567%——**全为负**：本核 fp16 路径（wall 134–146µs）比 CANN 的
+fp16 op（118.81µs）更慢。⚠ 口径警告：fp16 列的 `c` 用 fp16 wall 配 **bf16** 设备锚点（79.70µs 来自
+bf16 profile），故其绝对值只能定性读；但"远低于 1%"的结论与 bf16 列一致。
+
+**上板事实（三轮运行累积，见 §5.1）**：
+- 首版：全核 `aivec error / UB address ... not aligned`（kernel retCode=0x31）→ 已修复（标量 staging 写）；
+- 第二轮 smoke（Newton 细化之后）：mode 0 的 `x_out` 与 CANN `npu_add_rms_norm` **逐位一致（maxabs=0.0）**，
+  rstd 偏差从 2.29e-3（`Rsqrt` 近似）降到 **1.13e-5**（Newton 细化上板复验通过）；
+- 第三轮（本次）：64 例精度 + 48 例 oracle + S1 bf16/fp16 全部跑完，raw 落盘。
 
 ## 9. 断点续作清单（判定为"活"时才执行）
 
