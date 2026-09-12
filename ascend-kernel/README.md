@@ -208,7 +208,7 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | D≠128 或 blockSize≠128 | TORCH_CHECK 拒（L1TileShape 硬约束） |
 | 摊平形态子块行数 >32（T≥17 @group=5） | 已修复的 LSE staging 竞态历史缺陷；判据与回归见 design.md §11，升级改动后必跑 `test_lse_flatten_regression.py` |
 | 图捕获内 D2H/同步拷贝 | capture 拒绝（107027/107030）——本 op 的 v4 暂存区（pinned+non_blocking+内容去重）已内建，自写 op 引以为鉴：**进程级 registry 严禁持有需析构的 at::Tensor**（退出 GIL abort） |
-| CANN FIA v2（stage-2 搭档）的 TND 均匀变长+无 mask 角落 | 静默 NaN/aicore 异常（bug report 草稿在 `cascade-c3-results/probes/`）；生产形态（ragged+mask）与 BNSD 形态均安全；**任何 FIA 计时前先同数据对拍正确性，存活≠正确** |
+| CANN FIA v2（stage-2 搭档）的 TND 均匀变长+无 mask 角落 | **探针输入口径错误**：`actual_seq_kvlen` 传累计值 → 请求 r 从自身块表行起读 cum[r] 个 KV → 行越界读 → 垃圾块号 → MTE DDR 越界 0x800000 或静默 NaN（2026-09-08 定案，非布局限制、非算子缺陷；正确口径下 TND sm0 与 sm3 同测全 PASS，bug report 草稿在 `knowledge/evidence/c3-legacy/probes/`）；生产形态（ragged+mask）与 BNSD 形态均安全；**任何 FIA 计时前先同数据对拍正确性，存活≠正确** |
 | lse_merge 输入不连续 / dim 非 16 倍数 | TORCH_CHECK 拒 |
 | add_rms_norm_stats：`K > 5120` / `K % 16 != 0` / 两输入不同 dtype / mode∉{0,1,2} / fp32 输入 | TORCH_CHECK 拒（v1 整行 UB 驻留 + 32B 行拷贝约束） |
 | add_rms_norm_stats：AICore 无标量 `sqrtf`、且拒绝 `uint32→float` 强转 | 编译期即失败：1/K 由 host 传入、开方走向量 `Rsqrt`（勿在 kernel 里写 `sqrtf((float)kDim)`） |
@@ -259,6 +259,6 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | 注册面 | `csrc/register.cpp`（torch.ops.npu schema） |
 | 构建 | `./build.sh`（CATLASS_ARCH=2201 源内 define；catlass 整树在 `third_party/catlass/include/`） |
 | 生产消费者（插件） | `vllm-ascend-split-batch-hust/src/vllm_ascend_split_batch/cascade_{plugin,graph_plugin,runner_patch,gate,gate_self}.py` |
-| 测量报告 | `cascade-c3-results/probes/W0-B2-适配测量报告.md`（B2 适配）、`W1-stageB-报告.md`（融合线 NO-GO 依据） |
-| 知识库 | `资料/flashinfer-移植知识库/02-本地对照面.md`（自研算子与 CANN FIA 事实条目） |
+| 测量报告 | `knowledge/evidence/c3-legacy/probes/W0-B2-适配测量报告.md`（B2 适配）、`W1-stageB-报告.md`（融合线 NO-GO 依据） |
+| 知识库 | `knowledge/flashinfer-kb/02-本地对照面.md`（自研算子与 CANN FIA 事实条目） |
 | 多人协作/新算子流程 | `../docs/multi-operator-dev.md` |

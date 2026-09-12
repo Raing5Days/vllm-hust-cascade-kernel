@@ -74,5 +74,6 @@
 - **NPU 是共享资源**(当前仅 1 卡可见):大 bench / 长占用前在群里打招呼;
   micro-bench 一律分组进程(同进程 FIA 危害见 README §4/§5);
   跑挂了立即清理进程,不留占卡的僵尸任务。
-- 跨算子事实(如 FIA v2 的形态互斥、TND NaN 角落)写进各自的 design.md 并
+- 跨算子事实(如 FIA v2 的形态互斥、TND 计时探针须逐请求传 `actual_seq_kvlen`,
+  传累计值会越界读→静默 NaN/aicore 异常;计时前先对拍)写进各自的 design.md 并
   互相引用,不口头传播。
