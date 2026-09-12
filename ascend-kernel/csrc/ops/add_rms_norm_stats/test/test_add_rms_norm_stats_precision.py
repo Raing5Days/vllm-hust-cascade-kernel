@@ -3,7 +3,11 @@
 The full sweep (64 reference cases + 48 production-oracle cases, JSON/Markdown
 report) lives in run_precision_report.py; this file re-runs a representative
 slice as pytest cases so the operator is covered by the repo-wide `pytest -q`
-gate, and adds the negative (rejection) cases of test-cases.md 5.
+gate, and adds the negative (rejection cases) of test-cases.md 5.
+
+NPU resource discipline: this file executes real device work (including the
+M=2048 x K=5120 production shapes), so wrap it in the shared lock when other
+tasks are running: `flock /tmp/w3-npu.lock python -m pytest -q <this file>`.
 
 On a machine without an NPU the whole module is skipped.
 """
