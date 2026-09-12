@@ -49,6 +49,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_stats(
     const at::Tensor &x1, const at::Tensor &x2, const c10::optional<at::Tensor> &gamma,
     const c10::optional<at::Tensor> &beta, double eps, int64_t mode);
 
+// D3 Phase-0 benchmark probe (see ops/bw_probe/op_kernel header): the mode-0
+// memory pattern with the compute removed stage by stage, to measure the
+// achievable ceiling of that pattern. variant 0 = 2 reads + 1 write and zero
+// compute (the anchor), 1 = + the apply path, 2 = + the statistics path (must
+// reproduce add_rms_norm_stats mode 0's device time, i.e. it is the probe's own
+// validity check). Benchmark-only: only `out` is defined for variants 0/1.
+// Returns (out, rstd).
+std::tuple<at::Tensor, at::Tensor> bw_probe(const at::Tensor &x1, const at::Tensor &x2,
+                                            int64_t variant, double eps);
+
 } // namespace ascend_kernel
 
 #endif // OPS_H
