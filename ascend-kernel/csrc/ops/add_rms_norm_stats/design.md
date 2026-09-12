@@ -59,9 +59,12 @@ y   = round_dtype( fp32(xo) * rstd )          # 中间量按 golden 先舍入回
 - x_out（残差输出）与 y（norm 输出）的舍入口径严格照 CANN golden（bf16：`xOut=(x1+x2) in bf16`，
   统计基于 `xOut` 的 fp32 值；`y = (x_out*rstd).to(bf16) * gamma + beta`）——目标是与现役链
   **数值不可区分**（§6 判据 1e-3 量级），而不是"更准"。
-- 硬约束（op_host `TORCH_CHECK`）：两输入同 dtype（bf16/fp16）、连续、同 shape、K % 16 == 0
-  （32B 对齐）、K ≤ 16384（UB 单行 tile 上限，见 §5）、mode ∈ {0,1,2}、eps > 0。
-- **不支持 fp32**（本画像生产 dtype 是 bf16；fp16 为测试/对照 dtype）。mode 1 的 y 必须与 x1 同 dtype。
+- 硬约束（op_host `TORCH_CHECK`）：两输入同 dtype（bf16/fp16）、连续、2D、同 shape、
+  **K % 16 == 0**（32B 行拷贝）、**K ≤ 5120**（整行 UB 驻留，v1 限制；生产 hidden=5120 恒在域内）、
+  mode ∈ {0,1,2}、eps > 0；mode 1 要求 `gamma` 连续且 numel == K（`beta` 可缺省）。
+- **不支持 fp32**（本画像生产 dtype 是 bf16；fp16 为测试/对照 dtype）。mode 1 的 y 与 x1 同 dtype。
+- **rstd 输出按 `ceil(M/8)` 行分配**（每核按 8 行一组写 32B，4B 写在 910B 上挂），
+  第 M 行之后是 padding 零；消费方取 `rstd[:M]`。
 
 ### 1.1 为什么这个 op 是「F2 融合」的组成部分，而不是一个独立算子
 
@@ -184,26 +187,29 @@ saved_us_per_pair = t_norm_device − t_exposed_device
   每核连续 `rowsPerCore = ceil(M / aivNum)` 行，且**向上取整到 8 行**（保证每核起始行号
   8 对齐 → rstd 的 32B 对齐 DataCopy 合法；对齐纪律照 `lse_merge` 的 M2 修复口径）。
   尾核越界行直接不处理（`if (rowStart >= M) return;`）。
-- **UB 规划**（单行一条 tile，UB 用量 ~ 单行字节数 × 常数）：
+- **行内不切 K（v1 实现口径）**：整行 UB 驻留，所有向量算子是**单条行长**算子（K ≤ 5120
+  由 op_host 硬拒），行尾 pad 问题不存在（K % 16 == 0 已拒非对齐值 → 每笔行列拷贝都是
+  32B 整数倍）。**K > 5120 需 K 方向二级切分（v2）**；生产形态（norm 的行宽 = hidden = 5120）
+  恒在域内。
+- **UB 规划**（K=5120 bf16 实测口径，单核）：
 
-| 缓冲 | 大小（K=5120 为例） | 说明 |
+| 缓冲 | 大小（K=5120） | 说明 |
 |---|---|---|
-| inQue x1 / x2（depth 2 乒乓） | 2×10KB ×2 | bf16/fp16 行 tile |
-| outQue x_out / y | 2×10KB | dtype 宽 × 行 |
-| fp32 工作区（s / sq / acc） | 3×20KB | fp32 行宽 |
-| rstd 暂存行（RS_ROWS=8） | 32B | 攒够 8 行做一次 32B DataCopy |
+| inQueX1 / inQueX2（depth 2 乒乓） | 2×10KB ×2 | bf16/fp16 整行 tile |
+| outQue（depth 2） | 2×10KB | x_out / y 输出 |
+| fp32 工作区 bufA/bufB/ReduceSum work | 3×20KB | 残差和 / 统计输入 / 归约临时 |
+| bufSum（1 元素 + 对齐） | 32B | 归约目的 + rstd 向量算子载体 |
+| bufGamma / bufBeta（mode 1） | 2×20KB | gamma/beta 单次读入后常驻（避免逐行重读 20MB） |
+| bufRstd staging | 32B | 攒 8 行做一次 32B MTE3 |
+| bufMid（mode 2） | 10KB | 私有舍入中间量 |
 
-  单行 tile 上限 `K ≤ 16384`（x1+x2+out+3×fp32 ≈ K×(2+2+2+4+4+4) = 18K bytes；K=13824 时 ~243KB
-  已超 192KB UB → **v1 限制 K ≤ 16384 只在单行 tile 下成立；实测 down_proj 的 K=13824 形态需要
-  K 方向二次切分**。为控制本程风险，v1 的行内 K tile 用 `TILE_K = min(K, 8192)` 二级切分
-  （K>8192 时按 tile 累加，acc 向量化累加，行尾一次 ReduceSum）。**该上限只在 A/B 变体的 norm 侧
-  出现（x1 的行宽 = 上游 GEMM 的 N，Qwen2.5-14B 上 = 5120；K=13824 是 gate_up 的输入宽，
-  不是 norm 的行宽**）——即生产形态恒 K=5120，二级切分只为泛化/负例。
-- **buffer 分配**：`TQue<VECIN, 2>`×2（x1/x2）、`TQue<VECOUT, 2>`×1（输出）、
-  `TBuf<VECCALC>`×3（fp32 加/平方/累加器）、`TBuf<float>`×1（rstd 攒行）。
-- **归约**：行内 `acc[l] = Σ_tiles sq[l]`（向量累加，pad lane 恒 0）→ 行尾一次
-  `AscendC::ReduceSum` 得到该行 Σx²，`rstd = 1/sqrt(Σ/K + eps)`（fp32 标量）。
+  合计 ≈ 140KB（mode 1）/ 130KB（mode 0/2），余量 ~50KB。
+- **rstd 计算全程向量化**：`Muls(·, kInv)` → `Adds(·, eps)` → `Rsqrt` → `Muls(stage[staged], ·, 1.0f)`
+  ——AICore 代码**没有标量 `sqrtf`，也拒绝 uint32→float 强转**（两者都实测编译失败），
+  故 1/K 由 host 传入、开方走向量 `Rsqrt`；scalar 读只在 mode 1 施加步用一次。
+- **归约**：行内 `ReduceSum`（Level-2，fp32，work buffer = 行长）得到该行 Σx²。
   归约顺序与 CANN kernel 不保证一致 → 属 §6 容差内的合法分叉。
+- **buffer 分配**：`TQue<VECIN, 2>`×2、`TQue<VECOUT, 2>`×1、`TBuf<VECCALC>`（fp32 工作区/常驻 gamma/beta/staging）若干。
 
 ## 6. 精度参考实现与判据
 

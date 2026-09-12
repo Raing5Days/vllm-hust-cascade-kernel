@@ -3,6 +3,7 @@ FILE(GLOB OP_SRCS
     ${PROJECT_OP_SRC_BASE}/register.cpp
     ${PROJECT_OP_SRC_BASE}/ops/lse_merge/op_host/lse_merge.cpp
     ${PROJECT_OP_SRC_BASE}/ops/fa_fp32_stage1/op_host/fa_fp32_stage1.cpp
+    ${PROJECT_OP_SRC_BASE}/ops/add_rms_norm_stats/op_host/add_rms_norm_stats.cpp
     )
 
 # set the library output dir to the python dir for wheel package build
@@ -33,6 +34,13 @@ ascendc_library(no_workspace_kernel_fa STATIC
 ascendc_include_directories(no_workspace_kernel_fa PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/catlass/include
     ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/include
+)
+
+# add_rms_norm_stats: pure AIV (vector) kernel, two entries (bf16/fp16). Own
+# target for the same reason as lse_merge below (the mix-kernel target changes
+# the stub/registration flow); no catlass dependency.
+ascendc_library(no_workspace_kernel_norm STATIC
+    ${PROJECT_OP_SRC_BASE}/ops/add_rms_norm_stats/op_kernel/kernel_add_rms_norm_stats.cpp
 )
 
 # catlass gates its 910B (arch 2201) block/epilogue templates on CATLASS_ARCH.
@@ -71,6 +79,7 @@ target_link_libraries(${OP_PLUGIN_NAME} PRIVATE
         # workspace_kernel
         no_workspace_kernel
         no_workspace_kernel_fa
+        no_workspace_kernel_norm
         torch_npu
         ascendcl
         tiling_api

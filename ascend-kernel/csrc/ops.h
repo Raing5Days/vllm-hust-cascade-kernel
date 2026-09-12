@@ -37,6 +37,18 @@ std::tuple<at::Tensor, at::Tensor> fa_fp32_stage1(const at::Tensor &query, const
                                                   const at::Tensor &actual_kv_seqlens,
                                                   int64_t q_seqlen_value = 0);
 
+// F2 fusion "norm stage" (see ops/add_rms_norm_stats/design.md): the part of an
+// AddRmsNormBias -> GEMM fusion that stays exposed outside the GEMM, split out so
+// each candidate fusion topology can be measured with real silicon numbers.
+// mode 0: (x_out, rstd) = residual add + row statistics;
+// mode 1: (rstd, y)     = row statistics + norm apply (reads the rounded residual);
+// mode 2: (rstd)        = row statistics only.
+// Unused outputs come back as 0-element tensors. rstd is padded to ceil(M/8) rows
+// (32B MTE3 groups); rows >= M are padding.
+std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_stats(
+    const at::Tensor &x1, const at::Tensor &x2, const c10::optional<at::Tensor> &gamma,
+    const c10::optional<at::Tensor> &beta, double eps, int64_t mode);
+
 } // namespace ascend_kernel
 
 #endif // OPS_H
