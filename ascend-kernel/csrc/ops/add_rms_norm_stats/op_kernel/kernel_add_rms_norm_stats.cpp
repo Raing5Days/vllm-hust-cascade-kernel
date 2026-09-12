@@ -46,6 +46,19 @@ constexpr uint32_t RSTD_GROUP = 8;  // 8 fp32 rows = 32B: minimum legal MTE3 wri
 constexpr uint32_t MAX_K = 5120;    // per-row UB residency budget (op_host enforced)
 }  // namespace
 
+// D3 (design.md 9): the rstd chain (Rsqrt + one Newton step) is 9 count-1 vector
+// ops plus a PIPE_V barrier and a scalar round trip *per row*, i.e. 10 of the 17
+// vector instructions a row costs, all serving a single scalar. Batched mode
+// (batchStats != 0, modes 0/2 only) lets each row's sum of squares land in lane 0
+// of its own 32B slot, then runs the same chain once over the 8 slots
+// (count=64) per RSTD_GROUP rows: 9 instructions + 1 barrier per 8 rows instead
+// of per row. Every op in the chain is element-wise, so the per-lane results are
+// bit-identical to the per-row form - this is a scheduling change, not a
+// numeric one (the precision suite re-checks that claim).
+//
+// Mode 1 is excluded: its rstd is consumed as a scalar by Muls in the apply step
+// of the *same* row, so the value cannot be deferred to the group boundary.
+
 template <typename T>
 class AddRmsNormStats {
 public:
@@ -54,13 +67,16 @@ public:
     __aicore__ inline void Init(GM_ADDR x1, GM_ADDR x2, GM_ADDR gamma, GM_ADDR beta,
                                 GM_ADDR xOut, GM_ADDR rstd, GM_ADDR y, uint32_t mRows,
                                 uint32_t kDim, uint32_t modeIn, float epsIn, float kInvIn,
-                                uint32_t hasBetaIn)
+                                uint32_t hasBetaIn, uint32_t batchStatsIn, uint32_t pairSumIn)
     {
         this->kDim = kDim;
         this->mode = modeIn;
         this->eps = epsIn;
         this->kInv = kInvIn;
         this->hasBeta = hasBetaIn;
+        // Only modes 0/2 can batch (see the note above the class).
+        this->batchStats = (modeIn == 1u) ? 0u : batchStatsIn;
+        this->pairSum = pairSumIn;
 
         uint32_t cores = AscendC::GetBlockNum();
         uint32_t blockIdx = AscendC::GetBlockIdx();
@@ -119,6 +135,15 @@ public:
             }
         }
         this->pipe.InitBuffer(this->bufRstd, RSTD_GROUP * (uint32_t)sizeof(float));
+        if (this->batchStats != 0u) {
+            // 8 slots x 8 lanes: lane 0 of slot r is row r's sum of squares, so
+            // every ReduceSum destination is 32B aligned (a VEC write to element
+            // offsets 1..7 of a row faults, which is why the per-row path uses
+            // scalar SetValue). 256B each.
+            this->pipe.InitBuffer(this->bufSums, RSTD_GROUP * 8u * (uint32_t)sizeof(float));
+            this->pipe.InitBuffer(this->bufT64a, RSTD_GROUP * 8u * (uint32_t)sizeof(float));
+            this->pipe.InitBuffer(this->bufT64b, RSTD_GROUP * 8u * (uint32_t)sizeof(float));
+        }
     }
 
     __aicore__ inline void Process()
@@ -131,21 +156,38 @@ public:
         }
         AscendC::LocalTensor<float> rstdStage = this->bufRstd.template Get<float>();
         uint32_t staged = 0u;
+        if (this->batchStats != 0u) {
+            // Slot lanes other than lane 0 hold no row sum. Priming them with 0
+            // keeps every lane finite through the chain (Rsqrt(0+eps) = 1e3, no
+            // NaN), which matters because the chain covers all 64 lanes; the
+            // lanes of an unused slot are overwritten by the tail zeroing below.
+            PrimeSlots();
+        }
         for (uint32_t r = 0u; r < this->myRows; ++r) {
             ProcessRow(r, rstdStage, staged);
             if (++staged == RSTD_GROUP) {
                 // Partial groups never reach here (myRows is a multiple of
                 // RSTD_GROUP for every core but the last one).
+                if (this->batchStats != 0u) {
+                    RstdChainBatch(rstdStage);
+                }
                 FlushRstd(rstdStage, r + 1u - RSTD_GROUP);
                 staged = 0u;
+                if (this->batchStats != 0u && r + 1u < this->myRows) {
+                    PrimeSlots();
+                }
             }
         }
         if (staged != 0u) {
+            if (this->batchStats != 0u) {
+                RstdChainBatch(rstdStage);
+            }
             // Partial group: the tail lanes are zeroed and the rstd buffer is
             // padded to a multiple of RSTD_GROUP rows by op_host, so this stays
             // inside the allocation. Scalar writes only: a VEC instruction whose
             // UB address is not 32B aligned faults on 910B (measured, see
             // design.md 5), and element offsets 1..7 of a float row are not.
+            // Runs after the batch chain, which fills all 8 lanes.
             for (uint32_t i = staged; i < RSTD_GROUP; ++i) {
                 rstdStage.SetValue(i, 0.0f);
             }
@@ -220,8 +262,16 @@ private:
 
         // Sum of squares of the (rounded) norm input, reduced over the row.
         AscendC::Mul(bufA, bufB, bufB, kI);
+        if (this->batchStats != 0u) {
+            // Batched modes 0/2: ReduceSum writes lane 0 of slot `staged` itself
+            // (32B aligned), and the chain is deferred to the group boundary -
+            // so the rest of this function is never reached here. in1 was
+            // already freed above.
+            RowSumSq(this->bufSums.template Get<float>()[staged * RSTD_GROUP], bufA, kI);
+            return;
+        }
         AscendC::LocalTensor<float> sumD = this->bufSum.template Get<float>();
-        AscendC::ReduceSum<float>(sumD, bufA, this->bufWork.template Get<float>(), kI);
+        RowSumSq(sumD, bufA, kI);
         // rstd = 1/sqrt(mean + eps) with vector ops only: AICore code has no
         // scalar sqrtf and rejects uint32 -> float casts, so 1/K comes from the
         // host (kInv) and the reciprocal square root is the vector Rsqrt.
@@ -267,6 +317,76 @@ private:
         }
     }
 
+    // Row sum of squares. `src` is [kI] fp32 (the squared norm input) and is
+    // destroyed - it is folded in place; the result lands in dst[0].
+    //
+    // D3 (design.md 9): the golden's rstd is good to ~0.5 eps, while a plain
+    // AscendC::ReduceSum over K=5120 accumulates ~30 eps (measured, F2 raw
+    // f2_mode1_y_defect_evidence.md): the sum is combined from ~80 partials
+    // sequentially, so the error grows with the *number of partials*, not with
+    // log(K). That error moves round_dtype(x*rstd) across a dtype rounding
+    // boundary for ~3e-4 of the elements, which is what puts mode-1 `y` 1-2 ulp
+    // outside the CANN tier on 5/16 cases. Folding pairwise first (the skill's
+    // 二分累加, references/reduction/alg-dichotomy.md) shortens the accumulation
+    // to a binary tree of depth log2(K), so the final ReduceSum only sees 64
+    // elements and contributes ~8 eps of a partial instead of ~80 eps of the
+    // whole row. Same protocol, same rounding, only a shorter sum.
+    __aicore__ inline void RowSumSq(const AscendC::LocalTensor<float> &dst,
+                                    const AscendC::LocalTensor<float> &src, int32_t kI)
+    {
+        if (this->pairSum == 0u) {
+            AscendC::ReduceSum<float>(dst, src, this->bufWork.template Get<float>(), kI);
+            return;
+        }
+        uint32_t p2 = 1u;
+        while ((p2 << 1u) <= static_cast<uint32_t>(kI)) {
+            p2 <<= 1u;  // largest power of two <= kI
+        }
+        if (static_cast<uint32_t>(kI) > p2) {
+            // fold the tail onto the power-of-two window
+            AscendC::Add(src, src, src[p2], static_cast<int32_t>(static_cast<uint32_t>(kI) - p2));
+        }
+        while (p2 > 64u) {  // binary fold; every offset here is >= 64 fp32 = 256B, so 32B aligned
+            p2 >>= 1u;
+            AscendC::Add(src, src, src[p2], static_cast<int32_t>(p2));
+        }
+        AscendC::ReduceSum<float>(dst, src, this->bufWork.template Get<float>(),
+                                  static_cast<int32_t>(p2));
+    }
+
+    // Batched mode only: prime the 64 lanes of the slot buffer. Zero keeps every
+    // lane finite through Rsqrt, so no NaN reaches the vector unit from the
+    // lanes that carry no row sum.
+    __aicore__ inline void PrimeSlots()
+    {
+        AscendC::Duplicate(this->bufSums.template Get<float>(), 0.0f, RSTD_GROUP * 8u);
+    }
+
+    // Batched mode only (modes 0/2): rstd = 1/sqrt(mean+eps), Newton-refined,
+    // for RSTD_GROUP rows at once. Lane 0 of slot i holds row i's sum of squares;
+    // only those 8 lanes are consumed. Every operation here is element-wise, so
+    // each consumed lane sees exactly the sequence of values the per-row chain
+    // computes (same RoundMode, same order, same constants).
+    __aicore__ inline void RstdChainBatch(const AscendC::LocalTensor<float> &rstdStage)
+    {
+        AscendC::LocalTensor<float> s = this->bufSums.template Get<float>();
+        AscendC::LocalTensor<float> a = this->bufT64a.template Get<float>();
+        AscendC::LocalTensor<float> b = this->bufT64b.template Get<float>();
+        AscendC::Muls(s, s, this->kInv, RSTD_GROUP * 8u);
+        AscendC::Adds(s, s, this->eps, RSTD_GROUP * 8u);
+        AscendC::Muls(a, s, 1.0f, RSTD_GROUP * 8u);            // a = mean + eps
+        AscendC::Rsqrt(s, s, RSTD_GROUP * 8u);                 // r0
+        AscendC::Mul(b, a, s, RSTD_GROUP * 8u);                // a * r0
+        AscendC::Mul(b, b, s, RSTD_GROUP * 8u);                // a * r0^2
+        AscendC::Muls(b, b, -0.5f, RSTD_GROUP * 8u);           // -0.5 * a * r0^2
+        AscendC::Adds(b, b, 1.5f, RSTD_GROUP * 8u);            // 1.5 - 0.5 * a * r0^2
+        AscendC::Mul(s, s, b, RSTD_GROUP * 8u);                // r = r0 * (...)
+        AscendC::PipeBarrier<PIPE_V>();  // V -> S: the lanes are read by the scalar unit
+        for (uint32_t i = 0u; i < RSTD_GROUP; ++i) {
+            rstdStage.SetValue(i, s.GetValue(i * RSTD_GROUP));
+        }
+    }
+
     // Writes RSTD_GROUP rows of rstd (32B) starting at row `firstRow` of this core.
     __aicore__ inline void FlushRstd(const AscendC::LocalTensor<float> &stage, uint32_t firstRow)
     {
@@ -288,6 +408,10 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufGamma;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufBeta;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufRstd;
+    // batched-stat scratch (modes 0/2 only): 8 slots x 8 lanes of fp32
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufSums;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufT64a;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufT64b;
     AscendC::GlobalTensor<T> x1Gm;
     AscendC::GlobalTensor<T> x2Gm;
     AscendC::GlobalTensor<T> gammaGm;
@@ -298,6 +422,8 @@ private:
     uint32_t kDim = 0u;
     uint32_t mode = 0u;
     uint32_t hasBeta = 0u;
+    uint32_t batchStats = 0u;  // D3: batch the rstd chain per RSTD_GROUP rows (modes 0/2)
+    uint32_t pairSum = 0u;     // D3: pairwise (dichotomy) fold before the row ReduceSum
     uint32_t myRows = 0u;
     uint32_t rowStart = 0u;
     float eps = 1e-6f;
@@ -308,10 +434,11 @@ private:
     extern "C" __global__ __aicore__ void entry(                                                  \
         GM_ADDR x1, GM_ADDR x2, GM_ADDR gamma, GM_ADDR beta, GM_ADDR xOut, GM_ADDR rstd,          \
         GM_ADDR y, uint32_t mRows, uint32_t kDim, uint32_t mode, float eps, float kInv,           \
-        uint32_t hasBeta)                                                                          \
+        uint32_t hasBeta, uint32_t batchStats, uint32_t pairSum)                                  \
     {                                                                                             \
         AddRmsNormStats<elemType> op;                                                             \
-        op.Init(x1, x2, gamma, beta, xOut, rstd, y, mRows, kDim, mode, eps, kInv, hasBeta);       \
+        op.Init(x1, x2, gamma, beta, xOut, rstd, y, mRows, kDim, mode, eps, kInv, hasBeta,        \
+                batchStats, pairSum);                                                             \
         op.Process();                                                                             \
     }
 

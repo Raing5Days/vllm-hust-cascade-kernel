@@ -31,6 +31,8 @@
 
 #include "torch_kernel_helper.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <tuple>
 
 #include "aclrtlaunch_add_rms_norm_stats_bf16.h"
@@ -43,6 +45,27 @@ extern "C" uint32_t GetCoreNumForMixVectorCore(uint32_t *aiCoreNum, uint32_t *ve
 
 constexpr uint32_t kMaxK = 5120;      // per-row UB residency budget (kernel MAX_K)
 constexpr uint32_t kRstdGroup = 8;    // rstd rows per 32B MTE3 write
+
+// D3 A/B switch for the rstd-chain batching (kernel batchStats arg, design.md 9).
+// Default 0 = the F2-frozen per-row path, so every F2 number and the frozen
+// evidence stay reproducible; ARMNS_STATS=batch turns on the batched path
+// (modes 0/2 only). Read per call: getenv is ~100ns and this op is launched
+// ~2.7ms apart in production, so caching would only add a stale-config trap.
+uint32_t batchStatsFromEnv()
+{
+    const char *v = std::getenv("ARMNS_STATS");
+    return (v != nullptr && std::strcmp(v, "batch") == 0) ? 1u : 0u;
+}
+
+// D3 A/B switch for the pairwise (dichotomy) row-sum fold (kernel pairSum arg,
+// design.md 9): default 0 = the plain ReduceSum whose ~30 eps accumulation error
+// is the located cause of the mode-1 `y` tier violations; ARMNS_SUM=pair sums
+// pairwise first. Both are the same protocol - only the summation order differs.
+uint32_t pairSumFromEnv()
+{
+    const char *v = std::getenv("ARMNS_SUM");
+    return (v != nullptr && std::strcmp(v, "pair") == 0) ? 1u : 0u;
+}
 }  // namespace
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_stats(
@@ -96,6 +119,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_stats(
     const uint32_t kDimU = static_cast<uint32_t>(kDim);
     const uint32_t modeU = static_cast<uint32_t>(mode);
     const uint32_t hasBetaU = hasBeta ? 1u : 0u;
+    const uint32_t batchStatsU = batchStatsFromEnv();
+    const uint32_t pairSumU = pairSumFromEnv();
     const float epsF = static_cast<float>(eps);
     const float kInvF = 1.0f / static_cast<float>(kDim);  // AICore rejects uint32 -> float casts
 
@@ -109,10 +134,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_stats(
 
     if (isBf16) {
         EXEC_KERNEL_CMD(add_rms_norm_stats_bf16, blockDim, x1, x2Ptr, gammaPtr, betaPtr, xOutPtr,
-                        rstd, yPtr, mRowsU, kDimU, modeU, epsF, kInvF, hasBetaU);
+                        rstd, yPtr, mRowsU, kDimU, modeU, epsF, kInvF, hasBetaU, batchStatsU,
+                        pairSumU);
     } else {
         EXEC_KERNEL_CMD(add_rms_norm_stats_fp16, blockDim, x1, x2Ptr, gammaPtr, betaPtr, xOutPtr,
-                        rstd, yPtr, mRowsU, kDimU, modeU, epsF, kInvF, hasBetaU);
+                        rstd, yPtr, mRowsU, kDimU, modeU, epsF, kInvF, hasBetaU, batchStatsU,
+                        pairSumU);
     }
     return {xOut, rstd, y};
 }
