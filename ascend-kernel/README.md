@@ -215,6 +215,7 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | add_rms_norm_stats：行数分组写 rstd | 每核 8 行（32B）一写；4B 单写挂（与 fa 的 LSE 行 32B padded 同源教训），`rstd` 因此按 `ceil(M/8)` 行分配 |
 | add_rms_norm_stats：`Rsqrt` 在 910B 上是 ~2^-11 近似 | 单用 `Rsqrt` 得到的 rstd 与 CANN 差 2.29e-3（已超 2^-7 档位）；kernel 内必须跟一次 Newton 细化（`r *= 1.5 − 0.5·a·r²`）才回到 ~2^-22（上板复验：1.13e-5） |
 | add_rms_norm_stats：`rstd` 输出是 **(ceil(M/8), 1)** 二维 | 与 `(M,)` 的一维参考直接相减会被 torch **静默广播**成 `(M,M)` 两两配对，产出假精度结论（曾报 `rel_l2 0.64` 而逐元素最大相对误差只 0.066——对齐时 `rel_l2 ≤ MARE` 恒成立，见 test-cases.md §3.1）；比对前先 flatten，`test/test_add_rms_norm_stats_ref.py` 已固化该守卫 |
+| add_rms_norm_stats：行内平方和的**归约精度**决定 mode-1 `y` 的舍入边界 | 本核 `ReduceSum` 在 K=5120 上的误差 ≈ **30 eps**，现役 CANN ≈ 0.5 eps；该差使 `mid=round_dtype(x·rstd)` 在 3e-4 的元素上翻转，个别撞上 `y` 边界 ⇒ `y` 越 CANN 档位（4 ulp，2/1048 万元素）。**与现役算子对照时，归一化类算子的归约误差必须做到 ~1e-7 级**（补偿求和/分段树），否则单元素绝对档位必然被点状击穿（test-cases.md §3.2） |
 
 ## 6. 实测锚点（910B2 / CANN 9.0.1，2026-09）
 
@@ -230,6 +231,7 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | add_rms_norm_stats @M=2048,K=5120（F2 norm 段三 mode，bf16） | mode0 157.8 / mode1 153.1 / mode2 151.1µs；oracle `npu_add_rms_norm` 156.5µs | 910B2/CANN 9.1.0，warmup 20 + 100 次中位 × 3 轮 host wall，卡 7 + `flock /tmp/w3-npu.lock` |
 | **F2 gate ② 投影**（norm→GEMM 融合，判据式 design.md §4 实测前冻结） | A **−0.045%** / B''' 0.127% / B'' **0.200%** prefill | <1% ⇒ 按预注册规则**诚实关闭** A 变体；B 系上界一并上报 |
 | F2 结论：norm 段是**读带宽受限** | 有效带宽 ≈ 565GB/s（2×20.97MB / 74.25µs）；mode2 比 oracle 只快 3.5%（5.45µs/对） | 融合收益被带宽地板锁在 ~0.2% ⇒ 任何 norm→GEMM 拓扑都过不了 1% |
+| add_rms_norm_stats 精度 | 对照 fp64 参考 **52/64**、对照 CANN oracle **42/48**；失败全在 mode-1 `y`，每例 1–20 元素越档（分母 ≥26 万），`rel_l2` 4e-5~1.3e-4（档位 5e-3） | 档位取 CANN 官方逐元素档位（未放宽）；成因 = 行内归约精度（本核 30 eps vs CANN 0.5 eps）× `mid` 舍入边界翻转，见 test-cases.md §3.2 |
 
 ## 7. 文档与代码索引
 
@@ -240,7 +242,7 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | fa_fp32_stage1 回归脚本 | `test/test_fa_fp32_stage1_smoke.py`（S1 锚点）、`run_precision_suite.py`（30/30）、`test_q_seqlen_fastpath.py`、`test_lse_flatten_regression.py` |
 | lse_merge 设计 / 用例 | `csrc/ops/lse_merge/design.md` / `test/lse_merge-test-cases.md` |
 | add_rms_norm_stats 设计（F2 融合选型 + 预注册 gate ② 判据式） | `csrc/ops/add_rms_norm_stats/design.md` |
-| add_rms_norm_stats 用例与判据 / 精度报告 / S1 锚点脚本 | `csrc/ops/add_rms_norm_stats/test/add_rms_norm_stats-test-cases.md` / `*_precision_report.md` / `run_s1_anchor.py` |
+| add_rms_norm_stats 用例与判据 / 精度报告 / S1 锚点脚本 | `csrc/ops/add_rms_norm_stats/test/add_rms_norm_stats-test-cases.md`（§3 判据 + §3.1 判据实现缺陷 + §3.2 `y` 归约精度缺陷） / `add_rms_norm_stats_precision_report.md` / `run_s1_anchor.py` / `run_golden_selfcheck.py`（把同一档位用在现役 CANN 算子上，判定"判据是否可达"） / `test_add_rms_norm_stats_ref.py`（CPU-only 判据守卫） |
 | F2 立项与判定记录（画像侧） | `profiles/qwen14b-instruct-hotspot-20260910/f2-kernel/` |
 | 注册面 | `csrc/register.cpp`（torch.ops.npu schema） |
 | 构建 | `./build.sh`（CATLASS_ARCH=2201 源内 define；catlass 整树在 `third_party/catlass/include/`） |

@@ -311,6 +311,22 @@ bf16 profile），故其绝对值只能定性读；但"远低于 1%"的结论与
   rstd 偏差从 2.29e-3（`Rsqrt` 近似）降到 **1.13e-5**（Newton 细化上板复验通过）；
 - 第三轮（本次）：64 例精度 + 48 例 oracle + S1 bf16/fp16 全部跑完，raw 落盘。
 
+### 8.1 ① 精度（实测后回填）：**不达标（边际，仅在 mode-1 `y`）**
+
+- 复测（判据实现修正后，见 `test/add_rms_norm_stats-test-cases.md` §3.1/§3.2）：对照 fp64 参考
+  **52/64**、对照 CANN oracle **42/48**；**全部失败都在 mode 1 的 `y`**，每例 1–20 个元素越界
+  （分母 26 万–1048 万，占 1e-7~2e-6），差值为 **1 个 [4,8) 桶 ulp**；mode 0/2 与全部 rstd 比对
+  **100% 通过**。同 case `rel_l2` 仅 4e-5~1.3e-4（档位 5e-3）。
+- **不是"判据不可达"**：`test/run_golden_selfcheck.py` 把同一档位用在现役 CANN 算子上 → `cann_vs_ref`
+  **0/16 例越界**，本核 5/16 例；越界元素上 CANN 的 `y` 与 fp64 参考**逐位相同**。
+- **机制**：本核行内平方和的相对误差 ≈ **30 eps**（CANN ≈ 0.5 eps）；该误差使 `mid = round_dtype(x·rstd)`
+  在 3.2e-4（bf16）/ 2.8e-3（fp16）的元素上翻转，其中极少数又撞上 `y` 的舍入边界 ⇒ 越界 2–20 个。
+  逐元素复现见 `profiles/.../f2-kernel/raw/f2_probe_transcripts.log`。
+- **修法（未实施）**：行内归约改补偿求和（Neumaier）或分段树。**不改的理由**：本 op 的融合价值已被 ②
+  判死；且 Neumaier 每 64 元块多 ~8 条向量算子，本段已带宽受限（565GB/s），有把该段推向算力受限的风险。
+  ⇒ 记为**未闭环缺陷**，随 F2 归档；若另立 scope 复用本核，先补这项。
+- ② 的 S1 数字取自**本缺陷修复前的同一构建**（本程未改内核），故 ②/③ 口径自洽。
+
 ## 9. 断点续作清单（判定为"活"时才执行）
 
 1. GEMM 侧（A 形态）：`catlass Gemm::Kernel::OptimizedMatmul<PrologueA, void, BlockMmad<MmadAtlasA2PingPongWithPrologue>, BlockEpilogue, BlockScheduler>`，
