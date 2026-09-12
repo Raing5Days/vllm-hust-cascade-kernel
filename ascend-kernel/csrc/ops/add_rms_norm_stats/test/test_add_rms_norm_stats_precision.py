@@ -5,6 +5,16 @@ report) lives in run_precision_report.py; this file re-runs a representative
 slice as pytest cases so the operator is covered by the repo-wide `pytest -q`
 gate, and adds the negative (rejection cases) of test-cases.md 5.
 
+KNOWN OPEN DEFECT (2026-09-12, do not silence): mode-1 `y` still fails the
+elementwise tier on 1-20 elements out of millions per case. The cause is located
+- this kernel's row sum-of-squares is ~30 eps accurate where the incumbent CANN
+op is ~0.5 eps, and that difference flips the `round_dtype(x*rstd)` boundary for
+~3e-4 of the elements. See test-cases.md 3.2 for the per-element evidence and the
+remedy (compensated / segmented tree reduction). The cases below are expected to
+report failures on `y` until that reduction is fixed; xfail-ing them is
+deliberately NOT done, so the suite keeps stating the defect. The CPU-only half
+of the kit (test_add_rms_norm_stats_ref.py) passes independently of a device.
+
 NPU resource discipline: this file executes real device work (including the
 M=2048 x K=5120 production shapes), so wrap it in the shared lock when other
 tasks are running: `flock /tmp/w3-npu.lock python -m pytest -q <this file>`.
