@@ -211,6 +211,24 @@ saved_us_per_pair = t_norm_device − t_exposed_device
   归约顺序与 CANN kernel 不保证一致 → 属 §6 容差内的合法分叉。
 - **buffer 分配**：`TQue<VECIN, 2>`×2、`TQue<VECOUT, 2>`×1、`TBuf<VECCALC>`（fp32 工作区/常驻 gamma/beta/staging）若干。
 
+### 5.0 对照 `ascendc-tiling-design` skill 自查（2026-09-12，实现后补做）
+
+skill `.agents/skills/ascendc-tiling-design/`（只读）：本 op 归约形状 = 每行内 K 元素归约、行独立
+⇒ 按其场景路由（`references/reduction/patterns.md`）合轴后是 **(A1, R) 单轴归约、A0=1**，
+且"整行可驻 UB"→ **AR-FullLoad**（`references/reduction/ar-fullload.md`）。逐项对照其"通用设计要素"输出清单：
+
+| skill 要求 | 本设计 | 结论 |
+|---|---|---|
+| 多核切分：切分维度 / 每核任务量 / 核数 | 按 A1（行）连续切，每核 `ceil(M/coreNum)` 行且 8 行对齐；核数由 host `GetCoreNumForMixVectorCore` 取 AIV 数后按 `min(rowBlocks, aivNum)` 收窄 | ✅ 与 skill §3.2 同一形态 |
+| UB 切分：单次处理量 / 是否分 chunk / chunk 公式 | 单次处理 = 一整行（K ≤ 5120，≤ 10KB tile），**不切 chunk**；v1 由 op_host 硬拒 K > 5120（v2 才做 K 方向二级切分） | ✅ 明确取值 + 明确拒绝面 |
+| Buffer 规划：in/out/中间/double buffer + 用量 | 见上表（≈140KB / 192KB，余量 ~50KB）；inQue/outQue 均 depth 2（含 PreloadGammaBeta 复用 inQueX1 的注意点） | ✅ 与 ar-fullload.md §2.1 同构 |
+| 分支覆盖：dtype / shape / 对齐 / 边界 | 分支维度 = dtype(bf16/fp16) × mode(0/1/2) × beta 态 × M 整除性 × M=1 × K 对齐/非 2 幂；用例矩阵见 test-cases §4 | ✅ 8 shape × 2 dtype × 3 mode + 负例 |
+| **查缺 1**：tmpBuf 尺寸公式 | skill 给 `tmpBufSize = ⌈repeats/8⌉·8·typeSize`（fp32 K=5120 → 80 repeats → 320B，下限 4KB）。本设计 `bufWork` 直接给**一整行（20KB）**——**比公式宽松**，非缺陷；如收益需要可收缩至 4KB 省 16KB UB | ⚠ 偏保守（记录，不阻塞） |
+| **查缺 2**：非 32B 对齐 K 的处理 | skill 推荐 `DataCopyPad`；本设计走**拒绝**路线（K % 16 == 0），因此不引入 pad + count 分离（ar-fullload.md 的"常见问题：非对齐场景精度错误"在本版根本不存在） | ✅ 规避而非覆盖（已在 README §5 红线登记） |
+| **查缺 3**：`ReduceSum` 接口与 tmp 类型 | Level-2 `ReduceSum<float>(dst, src, tmp, count)`，`tmp` 与 dst/src **同类型 float**、count 用**有效元素数**（非对齐后长度）——与本设计一致；skill 明确 Level-2 **无对齐要求** | ✅ |
+| **查缺 4**：归约精度策略 | skill 列了"二分累加（dichotomy）"作为**大向量 sum 精度敏感**时的正交选项——本设计**未采用**，这正是 §5.2 记录的 30 eps 近似误差来源（skill 已提示该维度，属设计期漏选项，事后确认） | ❌ 设计期漏选（后果见 §5.2） |
+| **查缺 5**：double buffer 下标 | skill `api-12` 提示 `(loop-k)%N` 无符号下溢；本设计用 `TQue` 自动轮转、**不手算下标** ⇒ 该类风险不存在 | ✅ N/A |
+
 ### 5.1 实现期实测发现（两次上板，2026-09-12，910B2/CANN 9.1.0）
 
 1. **AICore 无标量 `sqrtf`、且拒绝 `uint32→float` 强转**（编译期两次报错）：1/K 由 host 传入（`kInv`），
@@ -226,6 +244,67 @@ saved_us_per_pair = t_norm_device − t_exposed_device
    UB 成本 64B），精度回到 ~2^-22 —— 因为融合的目标是"与现役链不可区分"，不能把预算花在近似上。
 4. **残差加（mode 0 的 x_out）与 CANN 逐位一致**（smoke：M=7/K=128/bf16，`maxabs = 0.0`）——
    与 §1 的舍入口径设计一致。
+
+### 5.2 对照 `ascendc-api-best-practices` skill 自查（2026-09-12，实现后补做）
+
+逐条核对本核实际用到的 API（skill 为只读参考：`.agents/skills/ascendc-api-best-practices/`）：
+
+| API / 约束 | skill 口径 | 本核用法 | 结论 |
+|---|---|---|---|
+| `DataCopy(GM↔UB)` | **仅严格 32B 对齐时允许**，否则必须 `DataCopyPad` | host 硬拒 `K % 16 != 0` ⇒ 行宽 bf16/fp16 恒为 32B 整数倍，全部搬运合法；全程**未用** `DataCopyPad` | ✅ 合规（且"非对齐 count 必须用有效长度"这类坑天然不存在） |
+| 禁 `GlobalTensor::SetValue/GetValue` | 效率极低（黑名单） | 本核**未用** GlobalTensor 标量访存；staging 用的是 `LocalTensor::SetValue` / `sumD.GetValue(0)`（skill 自己的 ar-fullload.md 示例同款） | ✅ 未触黑名单 |
+| `ReduceSum`（Level 2） | `(dst, src, tmp, count)`；`tmp` **必须同类型**；count 用**有效元素数**；Level-2 **无对齐要求** | `ReduceSum<float>(sumD, bufA, bufWork<float>, kI)`：三者为 `float`、count = K（有效长度） | ✅ 合规 |
+| `Rsqrt` 精度 | skill 未标（属实现精度）；§5.1 第 3 条实测其为 ~2^-11 近似 | 加一次 Newton 细化（回到 ~2^-22，上板复验 1.13e-5） | ✅ 已闭环 |
+| `repeatTimes ≤ 255` / `Compare 256B 对齐` | 相关限制条目 | 本核**不用** `Compare`，也**不手算** repeatTimes（全用带 count 的高层接口，单算子最长 K=5120=80 repeats 由接口内部处理） | ✅ N/A |
+| UB 标量 ↔ 向量序 | S/V 跨流水必须显式同步 | 见 §5.3 的同步自审（`PipeBarrier<PIPE_V>` / `PIPE_ALL`） | ⚠ 见 §5.3 |
+| `TQue<TBuf>`/`InitBuffer` 配对 | — | `TQue` Alloc/EnQue/DeQue/Free 全配对；早期 `InitBuffer` 按 mode 条件分配（未用分支不占 UB） | ✅ |
+
+### 5.3 对照 `ascendc-sync-audit` skill 自审（2026-09-12，**build 之后补做**，非 build 前）
+
+> ⚠ 纪律偏差如实记录：skill 要求"实现后、build 前"做本节。本核的 build 在自审之前完成
+> （当时未接该 skill）。故本节是**事后审计**，结论已按"是否需要在提交前修"分级。
+
+**脚本证据**（skill 自带工具，原样呈报，不做误报否决）：
+`sync_audit.py <kernel> --format json` 与 `--check pair/flow` 均给：
+
+| 候选 | 级别 | 位置 | 原样结论 | 人工复核 |
+|---|---|---|---|---|
+| SYNC-11 | 性能 | 264 行 | `EnQue→DeQue 后无计算，TQue 当 TBuf 用` | 该 DeQue 的消费者是紧跟的 **MTE3 `DataCopy`**（计算在 EnQue 之前已完成）；EnQue/DeQue 在此提供的正是 **V→MTE3 的隐式同步**，不是空转。**按 skill 规则 6 不否决该候选**，如实记录为"工具未把 DataCopy 计入消费者" |
+| SYNC-09 | 性能 | 273 行 | `PipeBarrier<PIPE_ALL> 粒度过粗` | 成立：此处依赖是 **S（标量 SetValue 写 staging）→ MTE3（DataCopy 读）**，`PIPE_ALL` 覆盖但过粗；且它每 8 行才执行一次、不在热循环内，实测该段已带宽受限 ⇒ **不影响判定**，可收窄为 `SetFlag/WaitFlag<HardEvent::S_MTE3>` |
+
+**能力边界（按 skill 要求显式声明，不静默跳过）**：`ascendc_flow_analyzer.py` 对本文件输出
+`operations: 7 / buffer_accesses: 0 / sync_edges: 0 / findings: 0`——正则 frontend 追不进
+`TQue/TBuf` **类成员**的 buffer 生命周期，故 **SYNC-14（信号与 buffer 索引一致性）无法机器验证**，
+降级为人工核对（下表由人工完成，符合 skill 的降级路径）。
+
+**人工数据流表（producer → consumer → 同步）**：
+
+| 数据依赖 | 本核实现 | 同步手段 | 判定 |
+|---|---|---|---|
+| MTE2 搬入 → V 计算 | `in1/in2 = AllocTensor → DataCopy → EnQue → DeQue` | TQue 隐式同步 | ✅ |
+| V 计算 → MTE3 搬出（x_out / y） | `outQue` Alloc → V 写 → EnQue → DeQue → DataCopy | TQue 隐式同步 | ✅ |
+| V（sumD 写）→ S（`GetValue(0)` 读） | 244 行 `PipeBarrier<PIPE_V>` | 显式 barrier | ✅ |
+| S（staging 写）→ MTE3（rstd DataCopy） | 273 行 `PipeBarrier<PIPE_ALL>` | 显式 barrier | ✅（过粗，见 SYNC-09） |
+| **MTE3（rstd 读 staging）→ S（下一组 staging 写）** | **无显式同步** | — | ⚠ **候选（SYNC-02 同类：buffer 复用未等上一轮 MTE3）** |
+| 核间 | 无任何 `CrossCore*/SyncAll`（行内归约，核间数据无关） | — | ✅ SYNC-03/12 N/A |
+| flagId / Atomic | 未使用 | — | ✅ SYNC-04/07/13 N/A |
+| 提前 return（`myRows == 0`） | 早退发生在任何 SetFlag 之前 | — | ✅ SYNC-08 N/A |
+
+**⚠ 候选的机理与处置（未改代码，按 skill"给出逐行方案后暂停"）**：`FlushRstd` 只在 DataCopy **之前**
+排一次 `PipeBarrier<PIPE_ALL>`（覆盖 S→MTE3 正方向），而**下一组**的 8 次 `rstdStage.SetValue`
+与该 MTE3 读之间没有 MTE3→S 的守护；若 MTE3 读滞后，理论上可读到被覆写一半的 staging。
+实践风险低（两组之间有 8 整行 MTE2+V 流水，实测三轮、>100 万次 32B flush 未出现数据错乱，
+且 `rstd` 在三轮间逐 case 稳定），但**按规范它是未同步的 WAR**。建议修法（二选一）：
+
+```diff
+@@ FlushRstd 之后 / 下一组写入前
++    AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(AscendC::EVENT_ID0);
++    AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(AscendC::EVENT_ID0);   // 首组需跳过
+```
+或（更省事、粒度更细）在 `ProcessRow` 内 staged==0 时插一次 `PipeBarrier<PIPE_ALL>()`——即把现有
+273 行的 barrier 复制到**每组写 staging 之前**。两种都需重跑精度/冒烟（另一把锁），故本程只记录方案。
+**本程判定：不阻塞 F2 结论**（② 已判死），但**若另立 scope 复用本核，必须先修此项**——已同步写入
+`profiles/.../f2-kernel/REPORT.md` 的风险栏与 README §5 红线。
 
 ## 6. 精度参考实现与判据
 - 参考实现：`test/add_rms_norm_stats_ref.py`（纯 torch CPU/GPU 无关，**同 CANN golden 语义**，
@@ -326,6 +405,27 @@ bf16 profile），故其绝对值只能定性读；但"远低于 1%"的结论与
   判死；且 Neumaier 每 64 元块多 ~8 条向量算子，本段已带宽受限（565GB/s），有把该段推向算力受限的风险。
   ⇒ 记为**未闭环缺陷**，随 F2 归档；若另立 scope 复用本核，先补这项。
 - ② 的 S1 数字取自**本缺陷修复前的同一构建**（本程未改内核），故 ②/③ 口径自洽。
+
+### 8.2 ① 判据改按 `ops-precision-standard` 后的复测：**通过**（2026-09-12，判定口径订正）
+
+**订正理由**：立项书原文与工作区 skill 都规定容差取"fp16/bf16 标准混合容差"，即
+`.agents/skills/ops-precision-standard/`（浮点计算类）的 **混合容差 + matched_ratio 规则**；
+§8.1/§6 早先用的是 **CANN 自带用例**的更严档位（`atol=rtol=2^-7/2^-10`，且要求全元素），
+档位与"整体判定规则"两处都与标准不同。现按标准重跑（判据实现见 `test-cases.md` §3，
+档位表逐字复制自 skill；**未放宽容差数值**，只是换成规定的那张表与那条规则）：
+
+| 口径 | 结果 |
+|---|---|
+| **标准档位（gate ① 判据）**：64 例 vs fp64 参考 | **64/64 通过**；`matched_ratio` 全为 **1.0**（标准只要求 ≥0.99）；`max_abs_error` 最大为上限的 **3.9%** |
+| **标准档位**：48 例 vs CANN oracle（要求逐元素全过） | **48/48 通过** |
+| 诊断列（不参与判定）：CANN 严档位全元素越界 | 12 个输出行非零，**全部是 mode-1 `y`**（bf16/1–6 个、fp16/1–20 个元素） |
+| 诊断列：`rel_l2` | `y` 4e-5~1.3e-4、`rstd` ~3e-6、`x_out` **0.0**（逐位一致） |
+
+⇒ **gate ① = 通过（按 ops-precision-standard）**。§8.1 的"不达标（边际）"在最严档位下**仍然成立**，
+作为**剩余数值质量风险**保留（修法与不改的理由同 §8.1，另见 §5.0 查缺 4：该精度策略在 tiling 阶段
+就属"漏选项"）；两档位并存不是双标——每次报告都把严档位越界数列出来，任何人都能按更严口径复判。
+
+**build/内核未动**：本轮只改判据实现与文档，内核与 wheel 与 ② 的 S1 数字同一构建（口径自洽）。
 
 ## 9. 断点续作清单（判定为"活"时才执行）
 
