@@ -59,6 +59,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> add_rms_norm_stats(
 std::tuple<at::Tensor, at::Tensor> bw_probe(const at::Tensor &x1, const at::Tensor &x2,
                                             int64_t variant, double eps);
 
+// F3 (SwiGLU into the gate_up GEMM epilogue) Phase B ladder; see
+// ops/f3_floor/design.md. Single catlass-backed AIC/AIV kernel with 4 modes:
+//   mode 0 floor : gate_up GEMM + "read the gate/up windows, write D = gate"
+//                  (the epilogue's exact byte pattern with zero compute)
+//   mode 1 swiglu: mode 0 with D = SiLU(gate) * up
+//   mode 2 gemm  : the GEMM alone (AIV only consumes the cross-core flags)
+//   mode 3 epi   : the floor epilogue alone (AIC only raises the flags)
+//   mode 4/5     : attribution rungs (D = up window; gate window only) - see the
+//                  kernel header. Measurement-only: no e2e consumer, and none of
+//                  these modes belongs to any plugin bundle. `workspace`
+//                  ([M, 2I] bf16) may be passed in to reuse/prime it; the C
+//                  workspace is returned.
+std::tuple<at::Tensor, at::Tensor> f3_gateup_epilogue(const at::Tensor &a, const at::Tensor &b,
+                                                     const c10::optional<at::Tensor> &workspace,
+                                                     int64_t mode);
+
 } // namespace ascend_kernel
 
 #endif // OPS_H

@@ -27,6 +27,7 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
     m.def("add_rms_norm_stats(Tensor x1, Tensor x2, Tensor? gamma, Tensor? beta, float eps, "
           "int mode) -> (Tensor, Tensor, Tensor)");
     m.def("bw_probe(Tensor x1, Tensor x2, int variant, float eps) -> (Tensor, Tensor)");
+    m.def("f3_gateup_epilogue(Tensor a, Tensor b, Tensor? workspace, int mode) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
@@ -35,6 +36,7 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     m.impl("fa_fp32_stage1", TORCH_FN(ascend_kernel::fa_fp32_stage1));
     m.impl("add_rms_norm_stats", TORCH_FN(ascend_kernel::add_rms_norm_stats));
     m.impl("bw_probe", TORCH_FN(ascend_kernel::bw_probe));
+    m.impl("f3_gateup_epilogue", TORCH_FN(ascend_kernel::f3_gateup_epilogue));
 }
 
 }  // namespace

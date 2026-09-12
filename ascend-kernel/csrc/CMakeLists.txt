@@ -5,6 +5,7 @@ FILE(GLOB OP_SRCS
     ${PROJECT_OP_SRC_BASE}/ops/fa_fp32_stage1/op_host/fa_fp32_stage1.cpp
     ${PROJECT_OP_SRC_BASE}/ops/add_rms_norm_stats/op_host/add_rms_norm_stats.cpp
     ${PROJECT_OP_SRC_BASE}/ops/bw_probe/op_host/bw_probe.cpp
+    ${PROJECT_OP_SRC_BASE}/ops/f3_floor/op_host/f3_floor.cpp
     )
 
 # set the library output dir to the python dir for wheel package build
@@ -50,6 +51,18 @@ ascendc_library(no_workspace_kernel_bwprobe STATIC
     ${PROJECT_OP_SRC_BASE}/ops/bw_probe/op_kernel/kernel_bw_probe.cpp
 )
 
+# f3_floor: F3 (SwiGLU-in-gate_up-epilogue) Phase B ladder - catlass AIC/AIV mix
+# kernel (paired gate/up blockMmad -> bf16 C workspace -> copy/silu epilogue).
+# Own target, same reason as the others; catlass headers via the include dir
+# below and CATLASS_ARCH defined source-locally (see the note underneath).
+ascendc_library(no_workspace_kernel_f3 STATIC
+    ${PROJECT_OP_SRC_BASE}/ops/f3_floor/op_kernel/kernel_f3_floor.cpp
+)
+ascendc_include_directories(no_workspace_kernel_f3 PRIVATE
+    ${PROJECT_SOURCE_DIR}/third_party/catlass/include
+    ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/include
+)
+
 # catlass gates its 910B (arch 2201) block/epilogue templates on CATLASS_ARCH.
 # The macro is defined source-locally in kernel_fa_fp32_stage1.cpp (NOT target-
 # wide: a target-wide -D leaked into the lse_merge compile and broke its fp32
@@ -88,6 +101,7 @@ target_link_libraries(${OP_PLUGIN_NAME} PRIVATE
         no_workspace_kernel_fa
         no_workspace_kernel_norm
         no_workspace_kernel_bwprobe
+        no_workspace_kernel_f3
         torch_npu
         ascendcl
         tiling_api

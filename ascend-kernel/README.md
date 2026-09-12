@@ -5,6 +5,10 @@
 > 以及 **F2 融合的 norm 阶段核 `add_rms_norm_stats`**（AddRmsNormBias→GEMM 融合立项第一程的测量仪器 + 阶段算子，见其 design.md）。
 > wheel：`ascend_kernel-2026.9.12`（CANN 9.1.0 / torch_npu 2.13.0rc1 环境重编）；主 shape = Qwen2.5-14B（H=40/KVH=8/D=128，hidden 5120，bf16）。
 > **单一事实源分工**：使用方法/场景/优势 = 本 README；算子内部设计 = `csrc/ops/<op>/design.md`；验证判据与用例 = `csrc/ops/<op>/test/*-test-cases.md`。
+>
+> **两个 measurement-only 探针**（不接 e2e、不进 bundle、不在上表）：`bw_probe`（D3 访问模式天花板锚点）与
+> `f3_floor`（F3 "SwiGLU 融进 gate_up epilogue" 的地板阶梯；**该立项已判负归档**，核保留作测量仪器/复用事实，
+> 见 `csrc/ops/f3_floor/design.md` 与 `profiles/qwen14b-instruct-hotspot-20260910/probe-f3/PHASE-B.md`）。
 
 ## 1. 三个算子一览
 
@@ -256,6 +260,8 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | add_rms_norm_stats 行和累加深度 CPU 研究（校准到实测） | `csrc/ops/add_rms_norm_stats/test/run_sum_accuracy_study.py` |
 | add_rms_norm_stats 用例与判据 / 精度报告 / S1 锚点脚本 | `csrc/ops/add_rms_norm_stats/test/add_rms_norm_stats-test-cases.md`（§3 判据（容差按 ops-precision-standard）+ §3.1 判据实现缺陷 + §3.2 CANN 严档位下的 `y` 归约精度差距 + §3.3 标准档位复测） / `f2_prec.{json,md}`（标准档位运行）+ `f2_prec_r2_cann_tier.{json,md}`（严档位运行） / `run_s1_anchor.py` / `run_golden_selfcheck.py`（两档位 × 三种配对，含"判据是否可达"的控制实验） / `test_add_rms_norm_stats_ref.py`（CPU-only 判据守卫，含与 skill checker 的对拍） |
 | F2 立项与判定记录（画像侧） | `profiles/qwen14b-instruct-hotspot-20260910/f2-kernel/` |
+| bw_probe 设计 / 使用（D3 访问模式锚点，measurement-only） | `csrc/ops/bw_probe/design.md` |
+| f3_floor 设计（F3 地板阶梯：配对 gate/up GEMM + 4 mode epilogue；**立项已判负归档**） | `csrc/ops/f3_floor/design.md`；判决与实测见 `profiles/qwen14b-instruct-hotspot-20260910/probe-f3/PHASE-B.md` |
 | 注册面 | `csrc/register.cpp`（torch.ops.npu schema） |
 | 构建 | `./build.sh`（CATLASS_ARCH=2201 源内 define；catlass 整树在 `third_party/catlass/include/`） |
 | 生产消费者（插件） | `vllm-ascend-split-batch-hust/src/vllm_ascend_split_batch/cascade_{plugin,graph_plugin,runner_patch,gate,gate_self}.py` |
