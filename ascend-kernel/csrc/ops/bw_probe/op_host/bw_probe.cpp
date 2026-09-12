@@ -42,14 +42,19 @@ std::tuple<at::Tensor, at::Tensor> bw_probe(const at::Tensor &x1, const at::Tens
     TORCH_CHECK(x2.defined() && x2.is_contiguous() && x2.sizes() == x1.sizes() &&
                     x2.scalar_type() == x1.scalar_type(),
                 "bw_probe: x2 must be contiguous, same shape and dtype as x1");
-    TORCH_CHECK(variant >= 0 && variant <= 4,
+    TORCH_CHECK(variant >= 0 && variant <= 6,
                 "bw_probe: variant must be 0 (copy), 1 (apply), 2 (mode0), "
-                "3 (no reduce) or 4 (no rstd math)");
+                "3 (no reduce), 4 (no rstd math), 5 (8-row tile copy) or 6 (8-row tile full)");
     const bool isBf16 = x1.scalar_type() == at::kBFloat16;
     const bool isFp16 = x1.scalar_type() == at::kHalf;
     TORCH_CHECK(isBf16 || isFp16, "bw_probe: x1 must be bf16 or fp16");
     const int64_t mRows = x1.size(0);
     const int64_t kDim = x1.size(1);
+    if (variant >= 5) {
+        // The 8-row tile design walks whole groups of 8 rows and needs K/8 x 32B rows.
+        TORCH_CHECK(mRows % 8 == 0, "bw_probe: variants 5/6 need M % 8 == 0");
+        TORCH_CHECK(kDim % 128 == 0, "bw_probe: variants 5/6 need K % 128 == 0 (K/8 x 32B rows)");
+    }
     TORCH_CHECK(kDim > 0 && kDim <= static_cast<int64_t>(kMaxK),
                 "bw_probe: K must be in (0, ", kMaxK, "]");
     TORCH_CHECK(kDim % 16 == 0, "bw_probe: K must be a multiple of 16 (32B row copies)");
