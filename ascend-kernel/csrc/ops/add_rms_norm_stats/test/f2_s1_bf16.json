@@ -1,0 +1,130 @@
+{
+ "op": "add_rms_norm_stats",
+ "dtype": "bf16",
+ "date": "2026-09-12",
+ "env": "910B2 / CANN 9.1.0 / torch_npu 2.13.0rc1",
+ "shapes": {
+  "prefill-main": {
+   "oracle_npu_add_rms_norm": {
+    "medians_us": [
+     157.11,
+     157.21,
+     156.53
+    ],
+    "best_us": 156.53
+   },
+   "mode0": {
+    "medians_us": [
+     157.75,
+     159.71,
+     158.58
+    ],
+    "best_us": 157.75
+   },
+   "mode1": {
+    "medians_us": [
+     153.07,
+     153.68,
+     154.33
+    ],
+    "best_us": 153.07
+   },
+   "mode2": {
+    "medians_us": [
+     151.08,
+     151.61,
+     151.76
+    ],
+    "best_us": 151.08
+   },
+   "matmul_N7168": {
+    "medians_us": [
+     533.93,
+     529.82,
+     531.42
+    ],
+    "best_us": 529.82
+   },
+   "matmul_N5120": {
+    "medians_us": [
+     413.83,
+     411.36,
+     410.32
+    ],
+    "best_us": 410.32
+   }
+  },
+  "decode": {
+   "oracle_npu_add_rms_norm": {
+    "medians_us": [
+     125.89,
+     124.13,
+     124.53
+    ],
+    "best_us": 124.13
+   },
+   "mode0": {
+    "medians_us": [
+     122.44,
+     122.68,
+     123.11
+    ],
+    "best_us": 122.44
+   },
+   "mode1": {
+    "medians_us": [
+     124.71,
+     123.56,
+     124.55
+    ],
+    "best_us": 123.56
+   },
+   "mode2": {
+    "medians_us": [
+     114.47,
+     112.81,
+     113.98
+    ],
+    "best_us": 112.81
+   },
+   "matmul_N7168": {
+    "medians_us": [
+     115.11,
+     114.4,
+     115.2
+    ],
+    "best_us": 114.4
+   },
+   "matmul_N5120": {
+    "medians_us": [
+     99.43,
+     99.35,
+     98.55
+    ],
+    "best_us": 98.55
+   }
+  }
+ },
+ "dispatch_calibration_us": 76.83,
+ "gate2_projection": {
+  "A_successor_prologue": {
+   "t_exposed_wall_us": 157.75,
+   "t_exposed_device_us": 80.92,
+   "saved_us_per_pair": -1.22,
+   "projection_prefill_pct": -0.045
+  },
+  "B_apply": {
+   "t_exposed_wall_us": 153.07,
+   "t_exposed_device_us": 76.24,
+   "saved_us_per_pair": 3.46,
+   "projection_prefill_pct": 0.127
+  },
+  "B_stats_only": {
+   "t_exposed_wall_us": 151.08,
+   "t_exposed_device_us": 74.25,
+   "saved_us_per_pair": 5.45,
+   "projection_prefill_pct": 0.2
+  }
+ },
+ "formula": "projection_pct = (79.70 - t_exposed_device) * 96 / 261710 * 100  [upper bound: GEMM-side fusion work accounted as free]"
+}
