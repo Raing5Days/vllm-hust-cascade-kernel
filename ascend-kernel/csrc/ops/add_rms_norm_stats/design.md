@@ -260,7 +260,27 @@ saved_us_per_pair = t_norm_device − t_exposed_device
 
 > 本节由实测回填；§4 的公式与阈值在上述提交中已冻结。
 
-（回填见本文件末尾「实测附录」与本仓 commit 的 REPORT。）
+**状态（2026-09-12 06:57）：② 的实测未完成**——共享 NPU 被并行任务（`probe-combined-e2e/v2`,
+3 prefix × 2 batch × 3 round × 2 leg 的 serve+bench 网格）持续占用，本程的排队任务
+（`/tmp/f2_run_all3.sh`，`flock -w 21600 /tmp/w3-npu.lock`）在报告落盘时仍在等待锁。
+排队链一次锁内跑完：smoke → 精度套件（64 例 + 48 oracle）→ S1 锚点（bf16/fp16）→
+`/tmp/f2_finalize.sh`（把 raw 落进算子库 `test/` 与 `profiles/.../f2-kernel/raw/`，并提交）。
+**判定规则不因等待改变**：§4 的公式/阈值在实测前已冻结；`gate2_projection` 由
+`run_s1_anchor.py` 按 §4 现算并写进 JSON，回填时不得调整。
+
+已完成的**上板事实**（两次运行，见 §5.1）：
+- 首版：全核 `aivec error / UB address ... not aligned`（kernel retCode=0x31）→ 已定位并修复（标量 staging 写）；
+- 修复后 smoke（M=7/K=128/bf16，Newton 细化**之前**的构建）：mode 0 的 `x_out` 与 CANN
+  `npu_add_rms_norm` **逐位一致（maxabs=0.0）**，mode 1/2 正常返回，rstd 偏差 2.29e-3（Rsqrt 近似，
+  已加 Newton 细化修复，**该修复尚未上板复验**——同一 NPU 锁原因）。
+
+**本程实测锚点（旁证，2026-09-12 卡 7，bf16，M=2048/K=5120，warmup 20 + 100 次中位 × 3 轮）**：
+
+| 项 | wall µs（best-of-3 中位） |
+|---|---|
+| `torch_npu.npu_add_rms_norm`（现役 AddRmsNormBias 的 C 面入口） | **142.9**（生产 profile 的设备时长 79.70µs ⇒ dispatch 标定 c ≈ 63.2µs） |
+| `aclcnnMatmul`（torch.matmul）K=5120 → N=7168 | **516.9**（profile：aclnnAddmm 505.45µs） |
+| `aclcnnMatmul` K=5120 → N=5120 | **398.4** |
 
 ## 9. 断点续作清单（判定为"活"时才执行）
 
