@@ -42,7 +42,9 @@ std::tuple<at::Tensor, at::Tensor> bw_probe(const at::Tensor &x1, const at::Tens
     TORCH_CHECK(x2.defined() && x2.is_contiguous() && x2.sizes() == x1.sizes() &&
                     x2.scalar_type() == x1.scalar_type(),
                 "bw_probe: x2 must be contiguous, same shape and dtype as x1");
-    TORCH_CHECK(variant >= 0 && variant <= 2, "bw_probe: variant must be 0 (copy), 1 (apply) or 2 (mode0)");
+    TORCH_CHECK(variant >= 0 && variant <= 4,
+                "bw_probe: variant must be 0 (copy), 1 (apply), 2 (mode0), "
+                "3 (no reduce) or 4 (no rstd math)");
     const bool isBf16 = x1.scalar_type() == at::kBFloat16;
     const bool isFp16 = x1.scalar_type() == at::kHalf;
     TORCH_CHECK(isBf16 || isFp16, "bw_probe: x1 must be bf16 or fp16");

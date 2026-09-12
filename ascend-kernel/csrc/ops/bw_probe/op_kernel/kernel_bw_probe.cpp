@@ -49,6 +49,11 @@ enum Variant {
     V_COPY = 0,
     V_APPLY = 1,
     V_MODE0 = 2,
+    // Ablations of V_MODE0: same ladder, one component removed, to split the
+    // statistics path (33us of mode0) into the row reduction and the per-row
+    // scalar/rstd tail.
+    V_NO_REDUCE = 3,   // drop ReduceSum (lane 0 of the squares stands in for the row sum)
+    V_NO_RSTD_MATH = 4,  // keep ReduceSum, drop the count-1 rsqrt/Newton chain
 };
 }  // namespace
 
@@ -110,13 +115,13 @@ public:
         for (uint32_t r = 0u; r < this->myRows; ++r) {
             ProcessRow(r, rstdStage, staged);
             if (++staged == RSTD_GROUP) {
-                if (this->variant == V_MODE0) {
+                if (this->variant >= V_MODE0) {
                     FlushRstd(rstdStage, r + 1u - RSTD_GROUP);
                 }
                 staged = 0u;
             }
         }
-        if (staged != 0u && this->variant == V_MODE0) {
+        if (staged != 0u && this->variant >= V_MODE0) {
             for (uint32_t i = staged; i < RSTD_GROUP; ++i) {
                 rstdStage.SetValue(i, 0.0f);
             }
@@ -164,7 +169,7 @@ private:
         this->inQueX2.FreeTensor(in2);
         AscendC::Add(bufA, bufA, bufB, kI);                              // fp32 residual sum
         AscendC::Cast(outT, bufA, AscendC::RoundMode::CAST_RINT, kI);    // = .to(dtype)
-        if (this->variant == V_MODE0) {
+        if (this->variant >= V_MODE0) {
             // Cast back from the *queued* tensor, exactly as add_rms_norm_stats
             // mode 0 does. Reading it after EnQue/DeQue/FreeTensor instead makes
             // the rstd disagree with the production op by ~5e-6 relative (measured,
@@ -184,11 +189,26 @@ private:
 
         AscendC::Mul(bufA, bufB, bufB, kI);
         AscendC::LocalTensor<float> sumD = this->bufSum.template Get<float>();
-        AscendC::ReduceSum<float>(sumD, bufA, this->bufWork.template Get<float>(), kI);
+        if (this->variant == V_NO_REDUCE) {
+            // Ablation: keep everything after the reduction, drop only the row
+            // reduction itself (lane 0 stands in for the row sum). Isolates the
+            // cost of ReduceSum over 5120 elements per row.
+            AscendC::Muls(sumD, bufA, 1.0f, 1);
+        } else {
+            AscendC::ReduceSum<float>(sumD, bufA, this->bufWork.template Get<float>(), kI);
+        }
         AscendC::Muls(sumD, sumD, this->kInv, 1);
         AscendC::Adds(sumD, sumD, this->eps, 1);
         AscendC::LocalTensor<float> tmp0 = this->bufTmp.template Get<float>();
         AscendC::LocalTensor<float> tmp1 = tmp0[8];
+        if (this->variant == V_NO_RSTD_MATH) {
+            // Ablation: keep the reduction and the scalar readback, drop the
+            // count-1 rsqrt + Newton-Raphson chain.
+            AscendC::PipeBarrier<PIPE_V>();
+            float rawVal = sumD.GetValue(0);
+            rstdStage.SetValue(staged, rawVal);
+            return;
+        }
         AscendC::Muls(tmp0, sumD, 1.0f, 1);
         AscendC::Rsqrt(sumD, sumD, 1);
         AscendC::Mul(tmp1, tmp0, sumD, 1);

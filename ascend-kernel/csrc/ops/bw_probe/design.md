@@ -34,11 +34,18 @@ bytes / (t_wall − c)   ，  c = t_wall(oracle) − 79.70us（生产 profile �
 | 0 `copy` | 读 x1、读 x2、写 out=in1，**零 vector 指令** | 2R + 1W | **模式天花板 anchor** |
 | 1 `apply` | + 两次 Cast(fp32)、Add、round Cast、写 out | 2R + 1W | mode0 输出路径的净成本 |
 | 2 `mode0` | + Cast 回 fp32、Mul(平方)、ReduceSum、rstd 向量数学、标量 GetValue/SetValue staging、写 rstd | 2R + 1W | **= add_rms_norm_stats mode0（自证有效）** |
+| 3 `no_reduce` | 同 v2，**去掉行归约**（用平方后 lane 0 顶替行和） | 2R + 1W | 剥离 `ReduceSum` 成本 |
+| 4 `no_rstd` | 同 v2，**去掉 rsqrt + Newton 链**（保留归约与标量回读） | 2R + 1W | 剥离 count-1 rstd 数学成本 |
 
 UD 占用对所有变体**相同**（寄存器/UB 压力是常量），故变体之间的差值是干净的单变量差。
 
 **自证条款**：若 variant 2 的器件时间与 `add_rms_norm_stats` mode 0 在同条件实测不一致
 （>5%），则本探针**没有**在复现生产模式，其余所有 rung 的数据都不得用于归因。
+
+⚠ **已知未闭环项（如实登记）**：v2 的 `out` 与生产 mode0 **逐位相等**，但 `rstd` 不是——
+探针相对 fp64 参考 **1.4e-05**（~60 ulp），生产算子 **1.7e-07**（1 ulp）。两者各自确定性
+（3 次重复逐位一致）。探针只用于**时间**归因，其 `rstd` 数值不作为任何证据；差异原因
+**未定位**（v2 与生产 mode0 的指令序列逐条相同，仅 in1 的 FreeTensor 位置与 variant 分支不同）。
 
 ## 2. 使用
 
