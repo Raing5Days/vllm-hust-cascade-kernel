@@ -431,7 +431,114 @@ bf16 profile），故其绝对值只能定性读；但"远低于 1%"的结论与
 
 **build/内核未动**：本轮只改判据实现与文档，内核与 wheel 与 ② 的 S1 数字同一构建（口径自洽）。
 
-## 9. 断点续作清单（判定为"活"时才执行）
+## 9. D3「读带宽优化」立项第一程（2026-09-12）：剖因、改动、判据
+
+预注册 gate（不得事后放宽）：② `add_rms_norm_stats` 读带宽 **565GB/s → ≥1.0TB/s**（prefill 主
+shape M=2048/K=5120 bf16），或折算 pass ≥1%；① 精度套件按 `ops-precision-standard` 全达标
+（含 mode-1 `y` 修复后回归，目标：CANN 严档位越界 5/16 → 0/16）。两条全过 → 候选成立。
+
+### 9.1 口径修正：565GB/s 是**反推值**，不是实测带宽
+
+F2 的 `t_exposed_device = wall − c`（`c = wall(oracle) − 79.70µs`）把 host 开销与设备时长混在
+一个减法里，且假设 oracle 在本 shape 的设备时长恰为生产 profile 的 79.70µs。两个假设都不成立：
+
+| 量 | F2 口径 | D3 实测（`torch_npu.profiler` 硬件时长） | 第三个独立佐证 |
+|---|---|---|---|
+| c（固定 host 开销） | 76.83µs | **≈100µs** | M 扫描截距：mode0 116.2 / mode2 101.8 / oracle 100.5µs；`wall − 设备时长` = 100.1µs（三者互证） |
+| mode0 设备时长 | 80.92µs | **54.45µs** | pipelined（循环内不同步）wall 58.51µs ≈ 设备时长 |
+| mode2 设备时长 | 74.25µs | **56.39µs** | pipelined wall 57.15µs ≈ 设备时长 |
+
+⇒ 565GB/s 应更正为 **743GB/s**（mode2 读 41.94MB / 56.39µs）。**但结论方向不变：本核确实未达
+1.0TB/s**，所以 ② 不是账面修正能过的。F2 的 gate② 判定不受影响（那条式子等价于 wall 直比，c 相消）。
+
+> ⚠ 口径：上述带宽是**同一 bench（同张量复用、L2-warm）**下的同源比较，与 565 同口径；生产
+> profile 的 `AddRmsNormBias` 83.88MB/79.70µs = 1.05TB/s 是 HBM-cold，两套口径分开列、不混算。
+
+### 9.2 剖因：**不是搬运受限，是 VEC + scalar 指令受限**
+
+主 shape、48 blocks、每核 43 行、1.8GHz（`aiv_total_cycles` 84,507/核 = 46.95µs ✓）：
+
+| target | 设备时长 | mte2 | **vec** | mte3 | **scalar** |
+|---|---|---|---|---|---|
+| mode0 | 54.45µs | 0.217 | **0.629** | 0.167 | **0.367** |
+| mode1 | 50.66µs | 0.156 | **0.789** | 0.183 | 0.341 |
+| mode2 | 56.39µs | 0.211 | **0.635** | 0.014 | 0.297 |
+| CANN `aclnnAdd`（**同 62.91MB**：2R+1W） | **17.54µs** | 0.759 | 0.781 | 0.402 | 0.165 |
+| CANN `Cast`（bf16→fp32，62.91MB） | 12.99µs | 0.399 | 0.198 | 0.863 | 0.116 |
+
+逐项归因（对照理想差距）：
+1. **MTE2 粒度/队列深度**：每行一次 10KB `DataCopy`，且**在同一轮迭代内被消费**（Alloc→DataCopy
+   →EnQue→DeQue 同轮）⇒ 深度 2 队列**没有形成跨行预取**；mte2 只占 22%，**搬得动**。
+   同字节 CANN elementwise 17.54µs 跑完 = **3.13x 头寸**。
+2. **UB 分块**：整行驻留（K=5120），未做多行 tile（行在 GM 连续，本可一次搬 R 行）。
+3. **读写重叠**：mte2 0.22 与 mte3 0.17 之和远小于时间线，读写基本串在依赖链上。
+4. **cast/中间步占比**：每行 6 条整行 VEC 里 **4 条是 cast**（x1↑、x2↑、rint↓、back↑）；
+   但 golden 口径（残差 fp32 加、统计用**舍入后**值）要求它们，且本 CANN 无混合精度 `Mul/Add`
+   重载（`kernel_operator_vec_binary_intf.h` 单模板参数 T）⇒ **不能靠混合算子省**。
+5. **标量介入**：每行 **9 条 count-1 VEC**（Rsqrt+Newton 链）+ 1 个 `PipeBarrier<PIPE_V>` +
+   GetValue/SetValue ⇒ **每行 17 条向量指令里 10 条只为 1 个标量服务**，且每行一次 V→S 全流水线停顿。
+   这就是 0.37 scalar / 0.63 vec 的来源。
+
+### 9.3 本轮两处改动（均已硬化为唯一行为，无开关）
+
+1. **批量化 rstd 链**（mode 0/2）：每行的平方和写进**自己那个 32B slot 的 lane 0**
+   （`ReduceSum` 的 dst 落在 32B 边界上——这正是逐行路径做不到、只能退化成标量 `SetValue` 的原因），
+   链在每 `RSTD_GROUP=8` 行上用 count=64 跑一次：**9 条 + 1 barrier / 8 行**，而不是每行。
+   链上每一步都是逐元素算子 ⇒ 每个被消费的 lane 看到的算子序列不变，**是调度改动而非数值改动**
+   （mode1 例外：它的 rstd 在同行的施加步被当标量用，无法推迟到组边界，故不参与批量化，Init 里强制）。
+2. **pairwise 行和 + 第二次 Newton**（两者同属"把 rstd 做到与 golden 同档"这一件事）：
+   - 行内平方和先做**二分折叠**（skill `alg-dichotomy`）到 64 项再由 `ReduceSum` 合并。原
+     `ReduceSum` 把 5120 项按 ~80 个 partial **顺序**合并，误差随 partial 数增长（实测 ≈30 eps），
+     这是 CPU 侧建模拟准过的（模拟 376 vs 实测 317 flips/百万元素；见 `run_sum_accuracy_study.py`）。
+   - **第二次 Newton 步**：向量 `Rsqrt` 在 910B 上只有 ~2^-11 近似，一次 Newton 后残留
+     ~1.5ε² ≈ 1e-5。**实测定位**：把行和做准之后，CANN 严档位越界元素（如 row 1512）的 rstd
+     相对差几乎不动（−3.389e-6 → −3.450e-6）⇒ 残差**不是**行和，而是 Rsqrt×Newton 的收敛底；
+     第二次 Newton 把迭代误差压到 1.5ε⁴，剩下的底是公式的 fp32 求值（~2 eps）。
+
+两次改动都在 D3 期间以 `ARMNS_STATS`/`ARMNS_SUM` 开关形式存在（便于同一 NPU 会话内 A/B），
+**实测后已删除开关、把胜出组合写成 host 常量** `kBatchStats=1 / kPairSum=1`；
+变体原始数据存档在 `profiles/.../f2-kernel/raw/d3_*.json` 与 `raw/prof_*/`。
+
+### 9.4 变体实测（profiler 设备时长，主 shape bf16，每格 20 次中位）
+
+| mode | base（F2 路径） | batch | pair | batch+pair | **本轮交付** batch+pair+N2 |
+|---|---|---|---|---|---|
+| mode0 | 54.45µs | **47.96** | 57.65 | 51.26 | 52.03 |
+| mode1 | 50.66µs | –（不参与） | 53.46 | 53.52 | 57.60 |
+| mode2 | 56.39µs | **49.82** | 58.95 | 53.11 | 53.23 |
+
+- 批量化是本轮唯一"净赚"的改动：**mode0 −11.9%、mode2 −11.6%**，与"per-row 标量链是主成本"的
+  假设一致（vec 29.6→24.3µs）。
+- pairwise 折叠 +6%（7 条 Add/行），Newton2 在批量路径只 +0.8µs、在 mode1 的逐行路径 +4.1µs
+  （5 条 count-1/行）——**精度是买来的**，mode1 因此比 base 慢 13.7%。
+- 读带宽（同口径）：mode0 770→874GB/s（batch）、mode2 744→842GB/s（batch）；
+  交付配置（要过 ① 必须带 N2）mode0 806 / mode2 788GB/s。
+
+### 9.5 D3 gate 判定：**② 不过 ⇒ 关闭归档**；① **通过**
+
+- **① 通过**：`ops-precision-standard` 档位 64/64（vs fp64 参考）+ 48/48（vs CANN oracle），
+  base 与交付配置都过；并且**任务指定的更严目标达成：CANN 严档位越界 5/16 → 0/16**
+  （控制组 CANN 自身 0/16，判据可达）。
+- **② 不过**：最好读带宽 874GB/s（mode0，batch）/<1.0TB/s；交付配置 806/788GB/s。
+  折算 pass 级（用同口径设备时长差，`(t_norm_device − t_exposed_device) × 96 / 261710`）：
+  base mode0 0.30% / mode2 0.23%；batch 0.54% / 0.47%；交付配置 0.39% / 0.34% —— **全部 <1%**。
+  （F2 原式若沿用生产的 HBM-cold 79.70µs 作基线，会得到 mode0-batch 1.16% 这类数字，但那是
+  "cold 基线 vs warm 被测"的跨口径混算，**不作为判据**，仅在此注明口径差异。）
+- ⇒ 按预注册规则**诚实关闭归档**：带宽既没到 1.0TB/s，折算 pass 也没到 1%。
+
+### 9.6 残余头寸与下一步（供下一批立项参考）
+
+剖因给出了明确的剩余头寸，且**说明目标本身不是硬件不可达**：同字节的 CANN elementwise 只用
+17.54µs（3.59TB/s R+W），而本核 52-54µs ⇒ **3x 结构性头寸**,其中：
+- **vec 只忙 0.60、scalar 忙 0.46**（交付配置）⇒ 大量气泡，不是吞吐到顶；
+- 攻法（按证据强度排序）：(a) **多行 tile（R=2/4）**——行在 GM 连续，一次搬 R 行可把
+  DataCopy/队列算子/scalar 记账按 R 摊薄（§9.2 第 1、5 条）；UB 实测余量可支持 R=2
+  （mode0 需 10B/元素 × R × K ≈ 102KB）；(b) **跨行预取（软件流水）**——把第 r+1 行的
+  `DataCopy` 提到第 r 行计算之前发起，消掉每行暴露的 MTE2 延迟；(c) `FlushRstd` 的
+  `PipeBarrier<PIPE_ALL>` 换成 V→MTE3 事件同步（§5.3 已列同一处候选）。
+  预估：若能把 elapsed 压到 vec 饱和线（~24µs/核），mode2 读带宽可到 ~1.5TB/s，② 即可过。
+
+## 10. 断点续作清单（判定为"活"时才执行）
 
 1. GEMM 侧（A 形态）：`catlass Gemm::Kernel::OptimizedMatmul<PrologueA, void, BlockMmad<MmadAtlasA2PingPongWithPrologue>, BlockEpilogue, BlockScheduler>`，
    自写 `PrologueA`（接口照 `PaddingMatrixNZ`：`paddingTag`/`GetWorkspaceSize`/`GetWorkspaceLayout`/`operator()`）：
