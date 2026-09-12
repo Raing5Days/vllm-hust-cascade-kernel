@@ -107,6 +107,7 @@ public:
         this->pipe.InitBuffer(this->bufB, f32Bytes);
         this->pipe.InitBuffer(this->bufWork, f32Bytes);
         this->pipe.InitBuffer(this->bufSum, 8u * (uint32_t)sizeof(float));
+        this->pipe.InitBuffer(this->bufTmp, 16u * (uint32_t)sizeof(float));  // 2 x 32B lanes
         if (this->mode == 2u) {
             // mode 2 only needs the rounded residual privately (no GM output).
             this->pipe.InitBuffer(this->bufMid, rowBytes);
@@ -142,9 +143,12 @@ public:
         if (staged != 0u) {
             // Partial group: the tail lanes are zeroed and the rstd buffer is
             // padded to a multiple of RSTD_GROUP rows by op_host, so this stays
-            // inside the allocation. Vector write, so the flush barrier below
-            // covers it as well.
-            AscendC::Duplicate(rstdStage[staged], 0.0f, static_cast<int32_t>(RSTD_GROUP - staged));
+            // inside the allocation. Scalar writes only: a VEC instruction whose
+            // UB address is not 32B aligned faults on 910B (measured, see
+            // design.md 5), and element offsets 1..7 of a float row are not.
+            for (uint32_t i = staged; i < RSTD_GROUP; ++i) {
+                rstdStage.SetValue(i, 0.0f);
+            }
             FlushRstd(rstdStage, this->myRows - staged);
         }
     }
@@ -221,14 +225,32 @@ private:
         // rstd = 1/sqrt(mean + eps) with vector ops only: AICore code has no
         // scalar sqrtf and rejects uint32 -> float casts, so 1/K comes from the
         // host (kInv) and the reciprocal square root is the vector Rsqrt.
+        // Rsqrt itself is a ~2^-11 approximation on 910B (measured: 1.4e-3
+        // relative deviation from the CANN npu_add_rms_norm rstd, see design.md
+        // 5/8), so one Newton-Raphson step r *= 1.5 - 0.5*a*r*r is applied
+        // (4 extra 1-element vector ops). All count-1 ops run on the 32B
+        // aligned base of bufSum / bufTmp lanes.
         AscendC::Muls(sumD, sumD, this->kInv, 1);
         AscendC::Adds(sumD, sumD, this->eps, 1);
-        AscendC::Rsqrt(sumD, sumD, 1);
-        AscendC::Muls(rstdStage[staged], sumD, 1.0f, 1);
+        AscendC::LocalTensor<float> tmp0 = this->bufTmp.template Get<float>();
+        AscendC::LocalTensor<float> tmp1 = tmp0[8];  // +32B: keeps VEC addresses aligned
+        AscendC::Muls(tmp0, sumD, 1.0f, 1);          // a = mean + eps
+        AscendC::Rsqrt(sumD, sumD, 1);               // r0
+        AscendC::Mul(tmp1, tmp0, sumD, 1);           // a * r0
+        AscendC::Mul(tmp1, tmp1, sumD, 1);           // a * r0^2
+        AscendC::Muls(tmp1, tmp1, -0.5f, 1);         // -0.5 * a * r0^2
+        AscendC::Adds(tmp1, tmp1, 1.5f, 1);          // 1.5 - 0.5 * a * r0^2
+        AscendC::Mul(sumD, sumD, tmp1, 1);           // r = r0 * (...)  (~2^-22)
+        AscendC::PipeBarrier<PIPE_V>();  // V -> S: sumD is read by the scalar unit below
+        float rstdVal = sumD.GetValue(0);
+        // Scalar write into the 8-row staging buffer: `rstdStage[staged]` for
+        // staged >= 1 is NOT 32B aligned, and a VEC instruction writing there
+        // faults with "UB address accessed by the VEC instruction is not
+        // aligned" (measured on 910B, first attempt of this kernel; scalar
+        // SetValue has no such constraint - lse_merge uses the same pattern).
+        rstdStage.SetValue(staged, rstdVal);
 
         if (this->mode == 1u) {
-            AscendC::PipeBarrier<PIPE_V>();  // V -> S: sumD is read by the scalar unit below
-            float rstdVal = sumD.GetValue(0);
             outT = this->outQue.template AllocTensor<T>();
             AscendC::Muls(bufA, bufB, rstdVal, kI);                          // x * rstd (fp32)
             AscendC::Cast(outT, bufA, AscendC::RoundMode::CAST_RINT, kI);    // round to dtype (golden)
@@ -261,6 +283,7 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufB;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufWork;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufSum;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> bufTmp;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufMid;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufGamma;
     AscendC::TBuf<AscendC::TPosition::VECCALC> bufBeta;

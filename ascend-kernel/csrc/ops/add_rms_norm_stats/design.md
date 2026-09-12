@@ -211,8 +211,23 @@ saved_us_per_pair = t_norm_device − t_exposed_device
   归约顺序与 CANN kernel 不保证一致 → 属 §6 容差内的合法分叉。
 - **buffer 分配**：`TQue<VECIN, 2>`×2、`TQue<VECOUT, 2>`×1、`TBuf<VECCALC>`（fp32 工作区/常驻 gamma/beta/staging）若干。
 
-## 6. 精度参考实现与判据
+### 5.1 实现期实测发现（两次上板，2026-09-12，910B2/CANN 9.1.0）
 
+1. **AICore 无标量 `sqrtf`、且拒绝 `uint32→float` 强转**（编译期两次报错）：1/K 由 host 传入（`kInv`），
+   `1/sqrt` 走向量 `Rsqrt`。
+2. **VEC 指令的 UB 地址必须 32B 对齐**（实测：首版把 rstd 逐行写进 staging 的 `stage[staged]`（元素偏移
+   1..7 = +4B..+28B）→ 全核 `aivec error ... "The UB address accessed by the VEC instruction is not
+   aligned"`，kernel task retCode=0x31）。修法：staging 写回退为**标量 `SetValue`**（标量无该约束，
+   与 `lse_merge` 同款），flush 前用 `PipeBarrier<PIPE_ALL>` 兜 S→MTE3 序；相同纪律也适用于
+   `Duplicate(stage[staged], ...)` 这类带元素偏移的向量写。
+3. **`Rsqrt` 在 910B 上是 ~2^-11 近似**（实测：未加修正时本核 rstd 与 CANN `npu_add_rms_norm` 的 rstd
+   偏差 `maxabs=2.29e-3`，且本核结果呈 10-bit 尾数特征 1.38671875 vs CANN 1.38575196）。
+   修法：**一次 Newton-Raphson 细化** `r *= 1.5 − 0.5·a·r²`（每行多 4 个 1 元素向量算子，
+   UB 成本 64B），精度回到 ~2^-22 —— 因为融合的目标是"与现役链不可区分"，不能把预算花在近似上。
+4. **残差加（mode 0 的 x_out）与 CANN 逐位一致**（smoke：M=7/K=128/bf16，`maxabs = 0.0`）——
+   与 §1 的舍入口径设计一致。
+
+## 6. 精度参考实现与判据
 - 参考实现：`test/add_rms_norm_stats_ref.py`（纯 torch CPU/GPU 无关，**同 CANN golden 语义**，
   见 §1 公式；fp64 累加版本另作"更准参考"用于误差来源分解）。
 - 判据（写进 `test/add_rms_norm_stats-test-cases.md`）：
