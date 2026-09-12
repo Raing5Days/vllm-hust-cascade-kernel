@@ -286,11 +286,17 @@ private:
         AscendC::LocalTensor<float> tmp1 = tmp0[8];  // +32B: keeps VEC addresses aligned
         AscendC::Muls(tmp0, sumD, 1.0f, 1);          // a = mean + eps
         AscendC::Rsqrt(sumD, sumD, 1);               // r0
-        AscendC::Mul(tmp1, tmp0, sumD, 1);           // a * r0
-        AscendC::Mul(tmp1, tmp1, sumD, 1);           // a * r0^2
-        AscendC::Muls(tmp1, tmp1, -0.5f, 1);         // -0.5 * a * r0^2
-        AscendC::Adds(tmp1, tmp1, 1.5f, 1);          // 1.5 - 0.5 * a * r0^2
-        AscendC::Mul(sumD, sumD, tmp1, 1);           // r = r0 * (...)  (~2^-22)
+        NewtonStep(sumD, tmp0, tmp1, 1);             // r1
+        if (this->pairSum != 0u) {
+            // D3: the vector Rsqrt is only a ~2^-11 approximation on 910B, and one
+            // Newton step leaves its square, ~1.5*eps^2 ~ 1e-5 worst case - which
+            // is exactly the residual rstd error measured on the elements that
+            // miss the CANN strict tier (they are unchanged when the row sum is
+            // made pairwise-accurate). A second step drives the iteration error to
+            // 1.5*eps^4 (far below fp32), leaving the fp32 evaluation of the
+            // formula (~2 eps) as the floor. Same formula, same rounding modes.
+            NewtonStep(sumD, tmp0, tmp1, 1);         // r2
+        }
         AscendC::PipeBarrier<PIPE_V>();  // V -> S: sumD is read by the scalar unit below
         float rstdVal = sumD.GetValue(0);
         // Scalar write into the 8-row staging buffer: `rstdStage[staged]` for
@@ -354,6 +360,20 @@ private:
                                   static_cast<int32_t>(p2));
     }
 
+    // One Newton-Raphson refinement of r = 1/sqrt(a): r *= 1.5 - 0.5*a*r^2.
+    // `a` is preserved, `tmp` is scratch, `r` is refined in place. Element-wise,
+    // so it is bit-identical regardless of how many lanes are active.
+    __aicore__ inline void NewtonStep(const AscendC::LocalTensor<float> &r,
+                                      const AscendC::LocalTensor<float> &a,
+                                      const AscendC::LocalTensor<float> &tmp, int32_t n)
+    {
+        AscendC::Mul(tmp, a, r, n);        // a * r
+        AscendC::Mul(tmp, tmp, r, n);      // a * r^2
+        AscendC::Muls(tmp, tmp, -0.5f, n); // -0.5 * a * r^2
+        AscendC::Adds(tmp, tmp, 1.5f, n);  // 1.5 - 0.5 * a * r^2
+        AscendC::Mul(r, r, tmp, n);        // r * (...)
+    }
+
     // Batched mode only: prime the 64 lanes of the slot buffer. Zero keeps every
     // lane finite through Rsqrt, so no NaN reaches the vector unit from the
     // lanes that carry no row sum.
@@ -376,11 +396,10 @@ private:
         AscendC::Adds(s, s, this->eps, RSTD_GROUP * 8u);
         AscendC::Muls(a, s, 1.0f, RSTD_GROUP * 8u);            // a = mean + eps
         AscendC::Rsqrt(s, s, RSTD_GROUP * 8u);                 // r0
-        AscendC::Mul(b, a, s, RSTD_GROUP * 8u);                // a * r0
-        AscendC::Mul(b, b, s, RSTD_GROUP * 8u);                // a * r0^2
-        AscendC::Muls(b, b, -0.5f, RSTD_GROUP * 8u);           // -0.5 * a * r0^2
-        AscendC::Adds(b, b, 1.5f, RSTD_GROUP * 8u);            // 1.5 - 0.5 * a * r0^2
-        AscendC::Mul(s, s, b, RSTD_GROUP * 8u);                // r = r0 * (...)
+        NewtonStep(s, a, b, RSTD_GROUP * 8u);                  // r1
+        if (this->pairSum != 0u) {
+            NewtonStep(s, a, b, RSTD_GROUP * 8u);              // r2 (see the note in ProcessRow)
+        }
         AscendC::PipeBarrier<PIPE_V>();  // V -> S: the lanes are read by the scalar unit
         for (uint32_t i = 0u; i < RSTD_GROUP; ++i) {
             rstdStage.SetValue(i, s.GetValue(i * RSTD_GROUP));
