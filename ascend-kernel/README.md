@@ -1,31 +1,34 @@
-# ascend-kernel：cascade 自研算子工程（fa_fp32_stage1 + lse_merge）
+# ascend-kernel：自研算子工程（fa_fp32_stage1 + lse_merge + add_rms_norm_stats）
 
-> 本工程 = 两个 CCE（Ascend C）算子的 torch extension：**共享前缀注意力核 `fa_fp32_stage1`**（fp32-out + LSE）与 **LSE 空间合并核 `lse_merge`**。二者合起来实现 vLLM cascade decode 的"两段式 + 数值稳定合并"，是精度分层（Tier1 fp32）的算子底座。
-> wheel：`ascend_kernel-2026.3.9`（已安装、与源码树构建一致）；主 shape = Qwen2.5-14B decode（H=40/KVH=8/D=128，bf16）。
+> 本工程 = CCE（Ascend C）算子的 torch extension：**共享前缀注意力核 `fa_fp32_stage1`**（fp32-out + LSE）、
+> **LSE 空间合并核 `lse_merge`**（二者合起来实现 vLLM cascade decode 的"两段式 + 数值稳定合并"，是精度分层 Tier1 的算子底座），
+> 以及 **F2 融合的 norm 阶段核 `add_rms_norm_stats`**（AddRmsNormBias→GEMM 融合立项第一程的测量仪器 + 阶段算子，见其 design.md）。
+> wheel：`ascend_kernel-2026.9.12`（CANN 9.1.0 / torch_npu 2.13.0rc1 环境重编）；主 shape = Qwen2.5-14B（H=40/KVH=8/D=128，hidden 5120，bf16）。
 > **单一事实源分工**：使用方法/场景/优势 = 本 README；算子内部设计 = `csrc/ops/<op>/design.md`；验证判据与用例 = `csrc/ops/<op>/test/*-test-cases.md`。
 
-## 1. 两个算子一览
+## 1. 三个算子一览
 
-| | `fa_fp32_stage1` | `lse_merge` |
-|---|---|---|
-| 一句话 | B=1 摊平读一段 paged KV 的 flash attention，**O 与 LSE 均以 fp32 输出** | 两分支注意力结果在 **LSE（log-sum-exp）空间数值稳定合并** |
-| 签名 | `(q, key, value, block_table, actual_q_seqlens, actual_kv_seqlens, q_seqlen_value=0) -> (out, lse)` | `(o1, o2, lse1, lse2, out_code=0) -> out` |
-| 在 cascade 中的角色 | **stage-1**：全 batch 摊平读一遍共享前缀（消 n 遍重读） | **合并**：stage-1(fp32) × stage-2(bf16 suffix) → 最终输出 |
-| 精度意义 | 长前缀 softmax 大归约以 fp32 累加（长上下文误差收敛） | 消 stage-1 bf16 舍入项，残余 ≈ w2·ε2 + ε_order |
+| | `fa_fp32_stage1` | `lse_merge` | `add_rms_norm_stats` |
+|---|---|---|---|
+| 一句话 | B=1 摊平读一段 paged KV 的 flash attention，**O 与 LSE 均以 fp32 输出** | 两分支注意力结果在 **LSE（log-sum-exp）空间数值稳定合并** | AddRmsNormBias 的**残差加 / 行统计 / norm 施加**三段解耦成三 mode（F2 融合的 norm 阶段核） |
+| 签名 | `(q, key, value, block_table, actual_q_seqlens, actual_kv_seqlens, q_seqlen_value=0) -> (out, lse)` | `(o1, o2, lse1, lse2, out_code=0) -> out` | `(x1, x2, gamma, beta, eps, mode) -> (x_out, rstd, y)`（mode 0/1/2，未用输出为空 tensor） |
+| 在 cascade 中的角色 | **stage-1**：全 batch 摊平读一遍共享前缀（消 n 遍重读） | **合并**：stage-1(fp32) × stage-2(bf16 suffix) → 最终输出 | **F2 融合前哨**：给出三种融合拓扑"暴露在 GEMM 之外"的下界，供 gate ② 判定；亦可作独立 norm 阶段算子 |
+| 精度意义 | 长前缀 softmax 大归约以 fp32 累加（长上下文误差收敛） | 消 stage-1 bf16 舍入项，残余 ≈ w2·ε2 + ε_order | 与 CANN `npu_add_rms_norm_bias` golden 同舍入口径（目标是与现役链数值不可区分） |
 
 ## 2. 使用方法
 
 ### 2.1 安装与注册
 
 ```bash
-pip install output/ascend_kernel-2026.3.9-cp312-cp312-linux_aarch64.whl --force-reinstall --no-deps
+pip install output/ascend_kernel-2026.9.12-cp312-cp312-linux_aarch64.whl --force-reinstall --no-deps
 ```
 
 ```python
-import ascend_kernel  # import 即注册 torch.ops.npu.fa_fp32_stage1 / lse_merge
+import ascend_kernel  # import 即注册 torch.ops.npu.fa_fp32_stage1 / lse_merge / add_rms_norm_stats
 # 验证：
 assert hasattr(torch.ops.npu, "fa_fp32_stage1")
 assert hasattr(torch.ops.npu, "lse_merge")
+assert hasattr(torch.ops.npu, "add_rms_norm_stats")
 ```
 
 ### 2.2 `fa_fp32_stage1`（stage-1 前缀注意力）
@@ -110,6 +113,33 @@ merged = torch.ops.npu.lse_merge(o1, o2.squeeze(2), l1, l2.reshape(B * H))
 # merged (B,H,D) bf16（out_code=0 跟随 o1 的 fp32；集成形态用 out_code=1 直出 bf16）
 ```
 
+### 2.5 `add_rms_norm_stats`（F2 融合的 norm 阶段核）
+
+```python
+x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
+    x1,        # (M, K) bf16/fp16 连续；残差加左项（生产语义 = 上游 GEMM 输出）
+    x2,        # (M, K) 同 dtype；残差加右项（生产语义 = 跨层 residual）；mode 1 忽略
+    gamma,     # (K,) 同 dtype 或 None（mode 1 必需）
+    beta,      # (K,) 同 dtype 或 None（mode 1 的 norm bias；Qwen2.5-14B 生产为 None）
+    eps,       # float，> 0
+    mode,      # 0 = 残差加 + 行统计 | 1 = 行统计 + norm 施加 | 2 = 只统计
+)
+# mode 0 -> (x_out (M,K), rstd (ceil(M/8),1) fp32, y=空)
+# mode 1 -> (x_out=空,      rstd, y (M,K))
+# mode 2 -> (x_out=空,      rstd, y=空)
+# 语义（= CANN npu_add_rms_norm_bias golden）：
+#   x_out = round_dtype(x1+x2);  rstd = 1/sqrt(mean_k(x_out^2)+eps)
+#   y     = round_dtype( round_dtype(x_out*rstd) * gamma + beta )
+```
+
+- 用途有二：① **独立 norm 阶段算子**（把"残差加 / 行统计 / 施加"拆开，供上层按融合形态取用）；
+  ② **F2 门控的测量仪器**——三 mode 分别给出"后继 GEMM prologue 融 norm（mode 0）"、
+  "上游 epilogue 融残差加后重算 norm（mode 1）"、"两侧都融只留统计（mode 2）"三种拓扑
+  中暴露在 GEMM 之外的下界（判据式见 `csrc/ops/add_rms_norm_stats/design.md` §4/§8）。
+- 硬约束：2D 连续、两输入同 dtype（bf16/fp16，**不支持 fp32**）、`K % 16 == 0`、**`K <= 5120`**（v1 整行 UB 驻留）、
+  `mode ∈ {0,1,2}`、`eps > 0`；mode 1 要求 `gamma.numel() == K`。
+- `rstd` 按 `ceil(M/8)` 行分配（每核 8 行一组写 32B），第 M 行之后为 padding 零，消费取 `rstd[:M]`。
+
 ## 3. 使用场景
 
 ### 3.1 设计场景：vLLM cascade decode（当前唯一生产消费者）
@@ -147,21 +177,26 @@ merged = torch.ops.npu.lse_merge(o1, o2.squeeze(2), l1, l2.reshape(B * H))
 
 ## 4. 环境配对与迁移纪律（重要）
 
-**wheel 兼容四元组**（`output/ascend_kernel-2026.3.9-cp312-cp312-linux_aarch64.whl`，ldd 实测 2026-09）：
+**wheel 兼容四元组**（`output/ascend_kernel-2026.9.12-cp312-cp312-linux_aarch64.whl`，2026-09-12 实编）：
 
 | 维度 | 值 | 说明 |
 |---|---|---|
 | 平台 tag | `linux_aarch64` | `NpuExtension` 自动产出正确 tag，禁止假 `py3-none-any` 携带 .so |
 | Python ABI | `cp312` | `_C.cpython-312-aarch64-linux-gnu.so` |
-| torch / torch_npu ABI | torch 2.10.0 + torch_npu 2.10.0.post2 | `_C.so` 的 torch 系 so 为 import 期延迟解析；torch 小版本升级必须重验 |
-| CANN runtime | 9.0.1（`libascendcl` / `libopapi`） | 仅运行时链接；目标机需 CANN runtime 在 `LD_LIBRARY_PATH` |
+| torch / torch_npu ABI | torch 2.13.0+cpu + torch_npu 2.13.0rc1 | `_C.so` 的 torch 系 so 为 import 期延迟解析；torch 小版本升级必须重验 |
+| CANN runtime | 9.1.0（`libascendcl` / `libopapi`，`/usr/local/ascend91`） | 仅运行时链接；目标机需 CANN runtime 在 `LD_LIBRARY_PATH` |
 
 四元组任一变化 = 重编 + 重发布，并同步更新本表。
+**回归范围声明（2026-09-12，新算子合入）**：本程全量重编（三个 kernel target），
+`add_rms_norm_stats` 走完精度 64/64 + oracle 48/48 + 负例 + S1 锚点；
+`fa_fp32_stage1` / `lse_merge` 在本程**只重编、未重跑各自 S1 位锚点与精度套件**
+（上一次全量回归 = commit `73bf96a`，CANN 9.1.0）。按四元组纪律，消费方接 wheel 前
+如需要 fa/lse 的重新背书，按下面顺序补跑：S1 bit 锚点 → 精度套件 → 图捕获冒烟。
 
 - **链接纪律**：CANN/torch 的 so 一律运行时链接，**严禁打进 wheel**；发布前审计包内容，只允许 `ascend_kernel/_C*.so`、`ascend_kernel/lib/libascend_kernel.so` 与纯 Python 文件。
 - **依赖方向**：本包只暴露 `torch.ops.npu.*`，**禁止 import 任何 vllm / vllm-ascend / 插件模块**；插件壳（`vllm-ascend-split-batch-hust`）单向依赖本包，本包对插件机制（manifest / entry point）不可见。
 
-- **版本配对**：wheel 按特定 CANN/torch_npu 工具链编译（当前配 CANN 9.0.1 + torch_npu 2.10.0.post2 + 910B2/`CATLASS_ARCH=2201`）。**换 CANN/soc 必须重编**（`./build.sh`，~2min），并按顺序回归：S1 bit 锚点 → 精度套件 → 图捕获冒烟。
+- **版本配对**：wheel 按特定 CANN/torch_npu 工具链编译（当前配 CANN 9.1.0 + torch_npu 2.13.0rc1 + 910B2/`CATLASS_ARCH=2201`）。**换 CANN/soc 必须重编**（`./build.sh`，~2min），并按顺序回归：S1 bit 锚点 → 精度套件 → 图捕获冒烟。
 - **正确性权威锚点**：S1 = 与 catlass example 二进制同输入 O/LSE **逐 bit 相等**（仅 q_len=1 域有效；摊平 q_len>1 域的权威 = fp64 对拍，见 design.md §11.4 历史口径订正）。
 - **同进程危害**（W0 实测）：`fa_fp32_stage1` 执行后，同进程再跑 kv≥8k 的 FIA v2 TND 块表形态触发 fftsplus aicore 0x800000——micro-bench 必须分组进程（生产不混用，无风险）。
 - **线程约束**：op 内 tiling 暂存区 registry 设计前提是 vllm worker 单线程调用；同 device 并发调用会竞争。
@@ -175,6 +210,9 @@ merged = torch.ops.npu.lse_merge(o1, o2.squeeze(2), l1, l2.reshape(B * H))
 | 图捕获内 D2H/同步拷贝 | capture 拒绝（107027/107030）——本 op 的 v4 暂存区（pinned+non_blocking+内容去重）已内建，自写 op 引以为鉴：**进程级 registry 严禁持有需析构的 at::Tensor**（退出 GIL abort） |
 | CANN FIA v2（stage-2 搭档）的 TND 均匀变长+无 mask 角落 | 静默 NaN/aicore 异常（bug report 草稿在 `cascade-c3-results/probes/`）；生产形态（ragged+mask）与 BNSD 形态均安全；**任何 FIA 计时前先同数据对拍正确性，存活≠正确** |
 | lse_merge 输入不连续 / dim 非 16 倍数 | TORCH_CHECK 拒 |
+| add_rms_norm_stats：`K > 5120` / `K % 16 != 0` / 两输入不同 dtype / mode∉{0,1,2} / fp32 输入 | TORCH_CHECK 拒（v1 整行 UB 驻留 + 32B 行拷贝约束） |
+| add_rms_norm_stats：AICore 无标量 `sqrtf`、且拒绝 `uint32→float` 强转 | 编译期即失败：1/K 由 host 传入、开方走向量 `Rsqrt`（勿在 kernel 里写 `sqrtf((float)kDim)`） |
+| add_rms_norm_stats：行数分组写 rstd | 每核 8 行（32B）一写；4B 单写挂（与 fa 的 LSE 行 32B padded 同源教训），`rstd` 因此按 `ceil(M/8)` 行分配 |
 
 ## 6. 实测锚点（910B2 / CANN 9.0.1，2026-09）
 
@@ -196,6 +234,9 @@ merged = torch.ops.npu.lse_merge(o1, o2.squeeze(2), l1, l2.reshape(B * H))
 | fa_fp32_stage1 测试用例与判据 | `csrc/ops/fa_fp32_stage1/test/fa_fp32_stage1-test-cases.md` |
 | fa_fp32_stage1 回归脚本 | `test/test_fa_fp32_stage1_smoke.py`（S1 锚点）、`run_precision_suite.py`（30/30）、`test_q_seqlen_fastpath.py`、`test_lse_flatten_regression.py` |
 | lse_merge 设计 / 用例 | `csrc/ops/lse_merge/design.md` / `test/lse_merge-test-cases.md` |
+| add_rms_norm_stats 设计（F2 融合选型 + 预注册 gate ② 判据式） | `csrc/ops/add_rms_norm_stats/design.md` |
+| add_rms_norm_stats 用例与判据 / 精度报告 / S1 锚点脚本 | `csrc/ops/add_rms_norm_stats/test/add_rms_norm_stats-test-cases.md` / `*_precision_report.md` / `run_s1_anchor.py` |
+| F2 立项与判定记录（画像侧） | `profiles/qwen14b-instruct-hotspot-20260910/f2-kernel/` |
 | 注册面 | `csrc/register.cpp`（torch.ops.npu schema） |
 | 构建 | `./build.sh`（CATLASS_ARCH=2201 源内 define；catlass 整树在 `third_party/catlass/include/`） |
 | 生产消费者（插件） | `vllm-ascend-split-batch-hust/src/vllm_ascend_split_batch/cascade_{plugin,graph_plugin,runner_patch,gate,gate_self}.py` |
