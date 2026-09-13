@@ -27,7 +27,8 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
     m.def("add_rms_norm_stats(Tensor x1, Tensor x2, Tensor? gamma, Tensor? beta, float eps, "
           "int mode) -> (Tensor, Tensor, Tensor)");
     m.def("bw_probe(Tensor x1, Tensor x2, int variant, float eps) -> (Tensor, Tensor)");
-    m.def("f3_gateup_epilogue(Tensor a, Tensor b, Tensor? workspace, int mode) -> (Tensor, Tensor)");
+    m.def("f3_gateup_epilogue(Tensor a, Tensor b, Tensor? workspace, Tensor? out_d, int mode) "
+          "-> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)

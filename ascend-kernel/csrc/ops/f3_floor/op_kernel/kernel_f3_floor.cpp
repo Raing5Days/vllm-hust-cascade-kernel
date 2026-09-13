@@ -87,6 +87,14 @@ constexpr uint32_t MODE_EPILOGUE_ONLY = 3;
 //                     cross-core protocol / scheduling, not bandwidth.
 constexpr uint32_t MODE_FLOOR_UP = 4;
 constexpr uint32_t MODE_FLOOR_GATE_ONLY = 5;
+//   7 floor_read_only   read the gate+up windows, write nothing (113.2 MB read
+//                       only)          -> is the C read what costs the GEMM?
+//   8 floor_write_only  write D without reading anything (56.6 MB write only)
+//                       -> is the D write what costs the GEMM?
+// Together with mode 0 (169.9 MB = both) these three rungs decompose the floor's
+// marginal cost into its read and write halves at the *same* block/flag count.
+constexpr uint32_t MODE_FLOOR_READ_ONLY = 7;
+constexpr uint32_t MODE_FLOOR_WRITE_ONLY = 8;
 
 using ElementA = bfloat16_t;
 using LayoutA = layout::RowMajor;    // activation x: [M, K] row major
@@ -122,6 +130,8 @@ struct F3Params {
     uint32_t m;
     uint32_t nHalf;  // I
     uint32_t k;
+    uint32_t dStride;  // D row stride in elements (I normally; 2I for an in-place
+                       // store into the gate half of the C workspace)
 };
 
 template <uint32_t MODE>
@@ -219,7 +229,7 @@ public:
             AscendC::GlobalTensor<ElementD> gmD;
             gmD.SetGlobalBuffer((__gm__ ElementD *)params.ptrD);
             layout::RowMajor layoutC(params.m, 2 * params.nHalf);
-            layout::RowMajor layoutD(params.m, params.nHalf);
+            layout::RowMajor layoutD(params.m, params.dStride);
 
             // UB per subcore (single stage): gate tile + up tile, bf16.
             AscendC::LocalTensor<ElementC> ubGate = ub.GetBufferByByte<ElementC>(0);
@@ -253,10 +263,13 @@ public:
                     layout::RowMajor lWin(rAct, nActual, 2 * params.nHalf);
 
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-                    copyIn(ubGate, gmC[layoutC.GetOffset(MatrixCoord{r0, n0})], lUb, lWin);
-                    if constexpr (MODE != MODE_FLOOR_GATE_ONLY) {
-                        copyIn(ubUp, gmC[layoutC.GetOffset(MatrixCoord{r0, params.nHalf + n0})],
-                               lUb, lWin);
+                    if constexpr (MODE != MODE_FLOOR_WRITE_ONLY) {
+                        copyIn(ubGate, gmC[layoutC.GetOffset(MatrixCoord{r0, n0})], lUb, lWin);
+                        if constexpr (MODE != MODE_FLOOR_GATE_ONLY) {
+                            copyIn(ubUp,
+                                   gmC[layoutC.GetOffset(MatrixCoord{r0, params.nHalf + n0})],
+                                   lUb, lWin);
+                        }
                     }
                     AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
 
@@ -270,8 +283,12 @@ public:
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
 
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-                    layout::RowMajor lD(rAct, nActual, params.nHalf);
-                    if constexpr (MODE == MODE_FLOOR_UP) {
+                    layout::RowMajor lD(rAct, nActual, params.dStride);
+                    if constexpr (MODE == MODE_FLOOR_READ_ONLY) {
+                        // read-only rung: no store to D (UB contents are written
+                        // by MTE2 but never consumed by MTE3 -- the DataCopyPad
+                        // reads above stay because they are hardware intrinsics).
+                    } else if constexpr (MODE == MODE_FLOOR_UP) {
                         copyOut(gmD[layoutD.GetOffset(MatrixCoord{r0, n0})], ubUp, lD, lUb);
                     } else {
                         copyOut(gmD[layoutD.GetOffset(MatrixCoord{r0, n0})], ubGate, lD, lUb);
@@ -300,9 +317,10 @@ private:
 }  // namespace
 
 CATLASS_GLOBAL void f3_gateup_epilogue(GM_ADDR a, GM_ADDR b, GM_ADDR workspace, GM_ADDR d,
-                                       uint32_t m, uint32_t nHalf, uint32_t k, uint32_t mode)
+                                       uint32_t m, uint32_t nHalf, uint32_t k, uint32_t mode,
+                                       uint32_t dStride)
 {
-    F3Params params{a, b, workspace, d, m, nHalf, k};
+    F3Params params{a, b, workspace, d, m, nHalf, k, dStride};
     if (mode == MODE_FLOOR) {
         F3GateUpKernel<MODE_FLOOR> kernel;
         kernel(params);
@@ -320,6 +338,12 @@ CATLASS_GLOBAL void f3_gateup_epilogue(GM_ADDR a, GM_ADDR b, GM_ADDR workspace, 
         kernel(params);
     } else if (mode == MODE_FLOOR_GATE_ONLY) {
         F3GateUpKernel<MODE_FLOOR_GATE_ONLY> kernel;
+        kernel(params);
+    } else if (mode == MODE_FLOOR_READ_ONLY) {
+        F3GateUpKernel<MODE_FLOOR_READ_ONLY> kernel;
+        kernel(params);
+    } else if (mode == MODE_FLOOR_WRITE_ONLY) {
+        F3GateUpKernel<MODE_FLOOR_WRITE_ONLY> kernel;
         kernel(params);
     }
 }

@@ -50,20 +50,24 @@ constexpr int64_t kModeGemmOnly = 2;
 constexpr int64_t kModeEpilogueOnly = 3;
 constexpr int64_t kModeFloorUp = 4;        // attribution rung: D = up window copy
 constexpr int64_t kModeFloorGateOnly = 5;  // attribution rung: gate window only (2/3 traffic)
-constexpr int64_t kModeMax = 5;
+constexpr int64_t kModeFloorReadOnly = 7;  // attribution rung: read only, no D store
+constexpr int64_t kModeFloorWriteOnly = 8; // attribution rung: D store only, no read
+constexpr int64_t kModeMax = 8;
 constexpr int64_t kNTile = 128;  // must match L1TileShape::N in the kernel
 }  // namespace
 
 std::tuple<at::Tensor, at::Tensor> f3_gateup_epilogue(const at::Tensor &a, const at::Tensor &b,
                                                       const c10::optional<at::Tensor> &workspace,
+                                                      const c10::optional<at::Tensor> &dIn,
                                                       int64_t mode)
 {
     TORCH_CHECK(a.dim() == 2 && a.is_contiguous() && a.scalar_type() == at::kBFloat16,
                 "f3_gateup_epilogue: a must be a contiguous bf16 [M, K]");
     TORCH_CHECK(b.dim() == 2 && b.is_contiguous() && b.scalar_type() == at::kBFloat16,
                 "f3_gateup_epilogue: b must be a contiguous bf16 [2I, K]");
-    TORCH_CHECK(mode >= kModeFloor && mode <= kModeMax,
-                "f3_gateup_epilogue: mode must be 0..5");
+    TORCH_CHECK((mode >= kModeFloor && mode <= kModeFloorGateOnly) ||
+                    mode == kModeFloorReadOnly || mode == kModeFloorWriteOnly,
+                "f3_gateup_epilogue: mode must be 0..5, 7 or 8");
     const int64_t mRows = a.size(0);
     const int64_t kDim = a.size(1);
     TORCH_CHECK(b.size(0) % 2 == 0, "f3_gateup_epilogue: b.size(0) must be even (gate | up)");
@@ -86,7 +90,23 @@ std::tuple<at::Tensor, at::Tensor> f3_gateup_epilogue(const at::Tensor &a, const
     } else {
         ws = at::empty({mRows, 2 * iHalf}, a.options());
     }
-    const auto d = at::empty({mRows, iHalf}, a.options());
+    // D: freshly allocated ([M, I], contiguous, stride(0) = I) unless the caller
+    // hands one in - e.g. the gate-half view of the workspace (stride(0) = 2I),
+    // which stores the activation in place over lines the fixpipe just wrote and
+    // therefore never allocates a new L2 line (this is the "does the D store cost
+    // come from write-allocate pollution or from port contention?" experiment).
+    const at::Tensor dGiven = (dIn.has_value() && dIn->defined()) ? *dIn : at::Tensor();
+    at::Tensor d;
+    int64_t dStride = iHalf;
+    if (dGiven.defined()) {
+        TORCH_CHECK(dGiven.scalar_type() == at::kBFloat16 && dGiven.dim() == 2 &&
+                        dGiven.size(0) == mRows && dGiven.size(1) == iHalf,
+                    "f3_gateup_epilogue: d must be bf16 [M, I]");
+        d = dGiven;
+        dStride = dGiven.stride(0);
+    } else {
+        d = at::empty({mRows, iHalf}, a.options());
+    }
 
     uint32_t aiCoreNum = 0;
     uint32_t vectorCoreNum = 0;
@@ -98,8 +118,9 @@ std::tuple<at::Tensor, at::Tensor> f3_gateup_epilogue(const at::Tensor &a, const
     const uint32_t nHalfU = static_cast<uint32_t>(iHalf);
     const uint32_t kU = static_cast<uint32_t>(kDim);
     const uint32_t modeU = static_cast<uint32_t>(mode);
+    const uint32_t dStrideU = static_cast<uint32_t>(dStride);
 
-    EXEC_KERNEL_CMD(f3_gateup_epilogue, aiCoreNum, a, b, ws, d, mU, nHalfU, kU, modeU);
+    EXEC_KERNEL_CMD(f3_gateup_epilogue, aiCoreNum, a, b, ws, d, mU, nHalfU, kU, modeU, dStrideU);
     return {d, ws};
 }
 
