@@ -235,17 +235,22 @@ kernel 侧另把它用作 S/P layout stride（`stackSeqTilePad = blockStackNum �
 | 删除 `kernel_common.hpp` 的死常量，改为指向本节的注释 | `kernel_common.hpp` |
 | 副本同步全部断言（只约束模板侧，**不妨碍**副本扫 STACKN） | `fia_grain_floor/op_kernel/kernel_fia_grain_floor.cpp` |
 
-### 12.4 验证（四层，2026-09-16；原始日志见 `probe-b1-floor/raw/guard/`）
+### 12.4 验证（五层，2026-09-16；原始日志见 `probe-b1-floor/raw/guard/`）
 
 1. **零语义变更**：重建后 `libascend_kernel.so` 与改前 **md5 逐字节相同**（`7c9f22df5512a05d8fc175857bf935a6`，多轮重建恒同）。
 2. **断言真的会拦**（两次独立反证）：令 `kPagedBlockSize = KV_SPLIT_SIZE*2` ⇒ **RC=2**；
    令 `kRowNumMax = 4096` ⇒ **RC=2**。报错文本即对应断言消息。验证后已还原。
-3. **本算子回归套件全绿**（README §4 要求的顺序）：
+3. ⚠ **跑的是哪个 lib（必读纪律）**：`import ascend_kernel` **默认解析到 site-packages 里安装的
+   2026.3.9**（lib md5 `ce8bf74f…`），**不是**本仓库构建（`7c9f22df…`）——两者二进制**不同**
+   （差异来自 2026.3.9 之后累积的其它改动，如 `lse_merge` 修复，**与本节守卫无关**）。
+   ⇒ **验证本仓库构建必须显式 `PYTHONPATH=<repo>/python/ascend_kernel`**，否则测的是装机版。
+4. **本算子回归套件全绿**（显式 PYTHONPATH=仓库构建；README §4 要求的顺序）：
    `test_fa_fp32_stage1_smoke.py` → **S1 与 example 二进制逐 bit 相等（O=True/LSE=True）**、
    S3 vs fp64 `1.866e-06 / 7.582e-07`（与 §9 历史值一致）、S4 10/10 ⇒ PASS；
-   `run_precision_suite.py` 完整版 → **30/30 PASS** + 3/3 负例；
+   `run_precision_suite.py --quick` → **8/8 PASS**（完整 30 例版在**装机版**上跑过，
+   **未**在仓库构建上重跑——如需：`PYTHONPATH=… python run_precision_suite.py 0`，约 125 s）；
    `test_lse_flatten_regression.py` → ALL PASS；`test_q_seqlen_fastpath.py` → PASS。
-4. **实机冒烟**：q=2048/kv=4096/B=1/H40/KVH8/D128 host wall **1239.9 µs**（改前 1239.0/1239.9），`out` 全有限。
+5. **实机冒烟**：q=2048/kv=4096/B=1/H40/KVH8/D128 host wall **1239.9 µs**（改前 1239.0/1239.9），`out` 全有限。
 
 ### 12.5 仍存在的边界（未覆盖，如实登记）
 
