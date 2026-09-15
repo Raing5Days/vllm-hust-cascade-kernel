@@ -12,7 +12,13 @@ import torch
 import torch_npu
 import ml_dtypes
 
-DATA = "/vllm-workspace/cascade-merge-op/catlass-example-data"
+# Example data lives at the repository root; derive it from this file's location
+# (test/ -> fa_fp32_stage1 -> ops -> csrc -> ascend-kernel -> <repo root>) rather
+# than hard-coding the pre-migration absolute path (see test_fa_fp32_stage1_smoke.py).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.normpath(
+    os.path.join(_HERE, "..", "..", "..", "..", "..", "catlass-example-data")
+)
 
 
 def main():

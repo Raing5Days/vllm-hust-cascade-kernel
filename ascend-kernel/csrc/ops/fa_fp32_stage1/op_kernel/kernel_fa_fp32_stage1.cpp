@@ -80,15 +80,20 @@ class FAInferKernel {
     //
     //     blockStackNum == QK::UNIT_BLOCK_STACK_NUM
     //                   == PV::UNIT_BLOCK_STACK_NUM
-    //                   == KV_BASE_BLOCK / pagedBlockSize          (512 / 128 = 4)
+    //                   == KV_BASE_BLOCK / KV_SPLIT_SIZE           (512 / 128 = 4)
     //
     // Neither the host op nor the templates guard this equality, so a mismatch
-    // fails *silently* on device: a smaller value deadlocks (the template still
-    // eats UNIT_BLOCK_STACK_NUM blocks while the kernel counts only blockStackNum
-    // of them, so the cross-core flag / L1 ping-pong pairing desynchronises), a
-    // larger one corrupts the S layout and overflows its workspace slot (128 *
-    // N*128 elements vs 131072 per slot in op_host).  Observed 1/2/8 -> hang,
-    // 16 -> illegal AIV access, 4 -> the only working value.
+    // fails silently on device.  Observed in the measurement copy
+    // (csrc/ops/fia_grain_floor, which sweeps this knob); 1/2/8 -> device hang,
+    // 16 -> aicore exception, 4 -> the only working value.  The *cause* of each
+    // observed failure mode is NOT established -- what is established is the
+    // contract violation and the two geometric inconsistencies it produces:
+    //   (i)  the template consumes UNIT_BLOCK_STACK_NUM blocks per call while the
+    //        kernel counts only blockStackNum of them (so the two disagree about
+    //        which KV blocks were covered and about the S slot rotation), and
+    //   (ii) the AIV epilogue window is `blockStackNum * KV_SPLIT_SIZE` columns
+    //        wide while the template always writes KV_BASE_BLOCK (512) columns.
+    // See REPORT-HANG.md sections 1-3 for what is code fact vs inference.
     // Root-cause write-up: profiles/qwen14b-instruct-hotspot-20260910/
     //                     probe-b1-floor/REPORT-HANG.md
     //
@@ -96,15 +101,35 @@ class FAInferKernel {
     // of re-hard-coding it, and the equalities below are pinned at compile time,
     // so any single-side edit fails the build instead of hanging the device.
     // ---------------------------------------------------------------------
-    static constexpr uint32_t kPagedBlockSize = 128;
+    // Page (KV block) size is taken from the template's own notion of a KV block,
+    // so this is the template's number, not a third copy of 128.  It must stay in
+    // step with the host's TORCH_CHECK(blockSize == 128) -- asserted below.
+    static constexpr uint32_t kPagedBlockSize = BlockMmadQK::KV_SPLIT_SIZE;
+    static_assert(kPagedBlockSize == 128,
+                  "fa_fp32_stage1: catlass KV_SPLIT_SIZE must stay 128 to match the host "
+                  "op_host TORCH_CHECK(blockSize == 128); change both together");
     static_assert(BlockMmadQK::UNIT_BLOCK_STACK_NUM == BlockMmadPV::UNIT_BLOCK_STACK_NUM,
                   "fa_fp32_stage1: catlass QK and PV FAI templates disagree on "
                   "UNIT_BLOCK_STACK_NUM; the blockStackNum/pagedBlockSize contract "
                   "cannot be satisfied by both");
     static_assert(BlockMmadQK::UNIT_BLOCK_STACK_NUM * kPagedBlockSize == BlockMmadQK::KV_BASE_BLOCK,
-                  "fa_fp32_stage1: UNIT_BLOCK_STACK_NUM * pagedBlockSize(128) must equal "
+                  "fa_fp32_stage1: UNIT_BLOCK_STACK_NUM * KV_SPLIT_SIZE must equal "
                   "catlass KV_BASE_BLOCK, which is also the S stride hard-coded in the "
                   "templates; see probe-b1-floor/REPORT-HANG.md");
+    // Workspace capacity guard.  The host allocates WORKSPACE_BLOCK_SIZE_DB
+    // elements per core per ping-pong slot (op_host's kWorkspaceBlockSizeDb --
+    // the same number kept in two places, see REPORT-HANG.md section 6).  The S
+    // matrix occupies rowNum * (stack x page) elements, and rowNum is bounded by
+    // 128 for this op: GetQNBlockTile keeps qSBlockSize * qNBlockTile <= 128 for
+    // every qSeqlen (verified by construction over qSeqlen = 1..8192).
+    // At the current stack depth this leaves 2x headroom (65536 of 131072); the
+    // guard fires if the templates ever grow the stack far enough to not fit.
+    static constexpr uint32_t kRowNumMax = 128;
+    static_assert(kRowNumMax * BlockMmadQK::UNIT_BLOCK_STACK_NUM * BlockMmadQK::KV_SPLIT_SIZE
+                      <= WORKSPACE_BLOCK_SIZE_DB,
+                  "fa_fp32_stage1: the S matrix no longer fits one workspace slot "
+                  "(rowNumMax * stack * page > WORKSPACE_BLOCK_SIZE_DB); raise the "
+                  "workspace in op_host and kernel_common.hpp together");
 
     // Methods
     CATLASS_DEVICE

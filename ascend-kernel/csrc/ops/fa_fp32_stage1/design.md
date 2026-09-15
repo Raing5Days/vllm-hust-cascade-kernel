@@ -214,10 +214,13 @@ kernel 侧另把它用作 S/P layout stride（`stackSeqTilePad = blockStackNum �
 ### 12.2 为什么必须守卫（原状：静默失败）
 
 - 模板的 `operator()` 一次**固定吃 `UNIT_BLOCK_STACK_NUM` 块**（`block_mmad_fai_qk_normal.hpp:190`），
-  而 kernel 以为只推进 `blockStackNum` 块；
-- 二者不等时：**更小值** ⇒ 记账/跨核 flag/L1 双缓冲预取配对失衡 ⇒ **死锁**；
-  **更大值** ⇒ S 布局错位 + **workspace 越界**（`128 × N×128` 元素 vs op_host 每 slot 131072）
-  ⇒ N=8 恰好顶格、N=16 需 2.0× slot ⇒ 挂死 / 非法 AIV 访问；
+  而 kernel 以为只推进 `blockStackNum` 块 ⇒ 二者不等时必然产生**两处不一致**（代码事实）：
+  **KV 覆盖不一致**（N<4 重复计页、N>4 跳过页）与 **AIV 窗口/AIC 产出尺寸不一致**
+  （AIV 的 S 窗口 = `N×128` 列、stride `N×128`，而模板恒按 `KV_BASE_BLOCK = 512` 列、stride 512 写 S）；
+- **S 容量**（纯算术）：读窗 `128 × N×128` 元素 vs op_host 每 slot `131072` ⇒ N=8 恰好顶格、N=16 越过 slot 1.0×；
+- ⚠ **失效触发点未建立**：实测 1/2/8 挂死、16 抛 aicore exception，但**"为什么恰好是这种表象"未定位**。
+  报告初版曾归因于"跨核 flag/L1 配对失衡"，**该归因已撤回**（逐次核算显示 N<4 时跨核 set/wait 仍配平）。
+  详见 `REPORT-HANG.md` §2.3（含仍未被验证的候选机制）。**本守卫拦截的是契约违反本身，不依赖该机制成立。**
 - **原本无任何守卫**：op_host 的 `TORCH_CHECK` 不校验栈深、模板无 `static_assert`，
   且 `kernel_common.hpp` 里那份 `UNIT_BLOCK_STACK_NUM` **定义了但从未被引用**。
 
@@ -226,19 +229,33 @@ kernel 侧另把它用作 S/P layout stride（`stackSeqTilePad = blockStackNum �
 | 改动 | 位置 |
 |---|---|
 | 栈深改为**派生**模板常量（消除两处独立硬编码） | `kernel_fa_fp32_stage1.cpp` AIC/AIV 两处 `blockStackNum = BlockMmad{QK,PV}::UNIT_BLOCK_STACK_NUM` |
-| `kPagedBlockSize = 128` 常量 + 两条 `static_assert`（QK/PV 一致；栈深×页大小 == `KV_BASE_BLOCK`） | `kernel_fa_fp32_stage1.cpp` 的 `FAInferKernel` 类头 |
+| 页大小取模板的 `KV_SPLIT_SIZE`（**不新造字面量**）+ 断言它 == 128（与 host `TORCH_CHECK` 对齐） | 同文件 `FAInferKernel` 类头 |
+| 断言 QK/PV 栈深一致；断言 `栈深 × KV_SPLIT_SIZE == KV_BASE_BLOCK`（模板内 S stride 字面量） | 同上 |
+| **工作区容量断言**：`kRowNumMax(128) × 栈深 × KV_SPLIT_SIZE ≤ WORKSPACE_BLOCK_SIZE_DB` | 同上；`kRowNumMax=128` 由暴力枚举核实（qSeqlen 1..4096 × group 1..32） |
 | 删除 `kernel_common.hpp` 的死常量，改为指向本节的注释 | `kernel_common.hpp` |
-| 副本同步同样两条断言（断言只约束模板侧，**不妨碍**副本扫 STACKN） | `fia_grain_floor/op_kernel/kernel_fia_grain_floor.cpp` |
+| 副本同步全部断言（只约束模板侧，**不妨碍**副本扫 STACKN） | `fia_grain_floor/op_kernel/kernel_fia_grain_floor.cpp` |
 
-### 12.4 验证（两条，2026-09-16）
+### 12.4 验证（四层，2026-09-16；原始日志见 `probe-b1-floor/raw/guard/`）
 
-1. **零语义变更**：重建后 `libascend_kernel.so` 与改前 **md5 逐字节相同**（`7c9f22df5512a05d8fc175857bf935a6`）；
-   实机冒烟（q=2048/kv=4096/B=1/H40/KVH8/D128）host wall **1239.9 µs**（改前 1239.0/1239.9），`out` 全有限。
-2. **断言真的会拦**：故意令 `kPagedBlockSize = 64`（违反契约）⇒ 构建 **RC=2 失败**，
-   报错文本即本守卫的 `static_assert` 消息并指向 `REPORT-HANG.md`。验证后已还原。
+1. **零语义变更**：重建后 `libascend_kernel.so` 与改前 **md5 逐字节相同**（`7c9f22df5512a05d8fc175857bf935a6`，多轮重建恒同）。
+2. **断言真的会拦**（两次独立反证）：令 `kPagedBlockSize = KV_SPLIT_SIZE*2` ⇒ **RC=2**；
+   令 `kRowNumMax = 4096` ⇒ **RC=2**。报错文本即对应断言消息。验证后已还原。
+3. **本算子回归套件全绿**（README §4 要求的顺序）：
+   `test_fa_fp32_stage1_smoke.py` → **S1 与 example 二进制逐 bit 相等（O=True/LSE=True）**、
+   S3 vs fp64 `1.866e-06 / 7.582e-07`（与 §9 历史值一致）、S4 10/10 ⇒ PASS；
+   `run_precision_suite.py` 完整版 → **30/30 PASS** + 3/3 负例；
+   `test_lse_flatten_regression.py` → ALL PASS；`test_q_seqlen_fastpath.py` → PASS。
+4. **实机冒烟**：q=2048/kv=4096/B=1/H40/KVH8/D128 host wall **1239.9 µs**（改前 1239.0/1239.9），`out` 全有限。
 
 ### 12.5 仍存在的边界（未覆盖，如实登记）
 
 - 模板内 **S stride 字面量 512** 与 `KV_BASE_BLOCK` 在模板里同为 512，但二者由**人工**保持一致；
   若将来只改 S stride 而不改 `KV_BASE_BLOCK`，本守卫**察觉不到**（模板只读，无法断言其内部字面量）。
-- 断言①（QK/PV 一致）在当前模板下无法本地证伪（需改只读依赖才会触发）。
+- 四条断言中只有两条**本地可证伪**（页大小 == 128、工作区容量）；另两条（QK/PV 一致、
+  `栈深×页大小 == KV_BASE_BLOCK`）只在模板侧变化时触发 ⇒ 需改只读依赖才能证伪，**未验**。
+- 编译器每个实例化只报**第一条**失败的断言：同一处打坏多个常量时，只看到最早那条消息。
+- `WORKSPACE_BLOCK_SIZE_DB` 在 **host（`kWorkspaceBlockSizeDb`）与 kernel 头（`WORKSPACE_BLOCK_SIZE_DB`）
+  各写一份 131072**（同类"双份常量"），本守卫只约束 kernel 侧那份；两份的一致性**无机械保障**
+  （与本节被守卫的契约是同一类脆弱点，见 `REPORT-HANG.md` §6）。
+- 工作区容量断言用的是 `≤`：栈深若变为 8 会**恰好等于** slot（零余量）而仍通过断言——
+  实测中"恰好顶格"的档位也失败了，但**失败是否因零余量所致并未确定**，故未凭此设阈值。

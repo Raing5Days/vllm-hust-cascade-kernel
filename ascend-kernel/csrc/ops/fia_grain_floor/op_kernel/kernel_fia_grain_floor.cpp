@@ -102,26 +102,37 @@ class FAInferKernel {
     using LayoutOTmp = typename EpilogueRescaleO::LayoutInput;
 
     // ---------------------------------------------------------------------
-    // BlockStackNum contract guard — same two assertions as the production op
+    // BlockStackNum contract guard — same assertions as the production op
     // fa_fp32_stage1 (see its class head for the full write-up, and
-    // probe-b1-floor/REPORT-HANG.md for the root-cause analysis).
+    // probe-b1-floor/REPORT-HANG.md for the analysis).
     //
     // NOTE for this measurement copy: these assertions check the *template*
     // side of the contract, which is fixed at 4.  They therefore fire only when
     // the catlass templates themselves change, and they do NOT constrain the
     // STACKN knob this copy exists to sweep — sweeping STACKN is precisely the
-    // point (1/2 deadlock, 8 deadlock, 16 illegal AIV access, 4 is the only
-    // contract-satisfying value).
+    // point (in the recorded runs: 1/2 -> hang, 8 -> hang, 16 -> aicore
+    // exception, 4 = the only contract-satisfying value; the *cause* of each
+    // failure mode is not established, only the contract violation is).
     // ---------------------------------------------------------------------
-    static constexpr uint32_t kPagedBlockSize = 128;
+    static constexpr uint32_t kPagedBlockSize = BlockMmadQK::KV_SPLIT_SIZE;
+    static_assert(kPagedBlockSize == 128,
+                  "fia_grain_floor: catlass KV_SPLIT_SIZE must stay 128 to match the host "
+                  "op_host TORCH_CHECK(blockSize == 128); change both together");
     static_assert(BlockMmadQK::UNIT_BLOCK_STACK_NUM == BlockMmadPV::UNIT_BLOCK_STACK_NUM,
                   "fia_grain_floor: catlass QK and PV FAI templates disagree on "
                   "UNIT_BLOCK_STACK_NUM; the blockStackNum/pagedBlockSize contract "
                   "cannot be satisfied by both");
     static_assert(BlockMmadQK::UNIT_BLOCK_STACK_NUM * kPagedBlockSize == BlockMmadQK::KV_BASE_BLOCK,
-                  "fia_grain_floor: UNIT_BLOCK_STACK_NUM * pagedBlockSize(128) must equal "
+                  "fia_grain_floor: UNIT_BLOCK_STACK_NUM * KV_SPLIT_SIZE must equal "
                   "catlass KV_BASE_BLOCK, which is also the S stride hard-coded in the "
                   "templates; see probe-b1-floor/REPORT-HANG.md");
+    // Same workspace-capacity bound as the production op (see its class head).
+    static constexpr uint32_t kRowNumMax = 128;
+    static_assert(kRowNumMax * BlockMmadQK::UNIT_BLOCK_STACK_NUM * BlockMmadQK::KV_SPLIT_SIZE
+                      <= WORKSPACE_BLOCK_SIZE_DB,
+                  "fia_grain_floor: the S matrix no longer fits one workspace slot "
+                  "(rowNumMax * stack * page > WORKSPACE_BLOCK_SIZE_DB); raise the "
+                  "workspace in op_host and kernel_common.hpp together");
 
     // Methods
     CATLASS_DEVICE
