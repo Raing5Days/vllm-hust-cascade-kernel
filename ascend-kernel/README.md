@@ -6,9 +6,17 @@
 > wheel：`ascend_kernel-2026.9.12`（CANN 9.1.0 / torch_npu 2.13.0rc1 环境重编）；主 shape = Qwen2.5-14B（H=40/KVH=8/D=128，hidden 5120，bf16）。
 > **单一事实源分工**：使用方法/场景/优势 = 本 README；算子内部设计 = `csrc/ops/<op>/design.md`；验证判据与用例 = `csrc/ops/<op>/test/*-test-cases.md`。
 >
-> **两个 measurement-only 探针**（不接 e2e、不进 bundle、不在上表）：`bw_probe`（D3 访问模式天花板锚点）与
+> **三个 measurement-only 探针**（不接 e2e、不进 bundle、不在上表）：`bw_probe`（D3 访问模式天花板锚点）与
 > `f3_floor`（F3 "SwiGLU 融进 gate_up epilogue" 的地板阶梯；**按原设计判 NO-GO（就地写形态硬门通过、但复合账净亏）⇒ 不立项**，核保留作测量仪器/复用事实，
-> 见 `csrc/ops/f3_floor/design.md` 与 `profiles/qwen14b-instruct-hotspot-20260910/probe-f3/PHASE-B.md`）。
+> 见 `csrc/ops/f3_floor/design.md` 与 `profiles/qwen14b-instruct-hotspot-20260910/probe-f3/PHASE-B.md`），
+> 以及 `fia_grain_floor`（**B1 prefill attention 实现面**的 KV 搬运粒度阶梯；`fa_fp32_stage1` 的副本，
+> 唯一变量 = 源内 define `B1_GRAIN_STACK_NUM`；**结论**：栈深 1/2/8 挂死、16 抛 aicore exception，
+> **只有生产默认值 4 可跑** ⇒ 该杠杆不可单变量使用；B1 线按地板核实测判 **NO-GO**，
+> 见 `csrc/ops/fia_grain_floor/design.md` 与 `profiles/qwen14b-instruct-hotspot-20260910/probe-b1-floor/REPORT-GRAIN.md`）。
+>
+> **版本号纪律（探针的例外，判断留痕）**：`config.ini` 的 bump 规则针对**生产面**变更。
+> 上述三个探针均为 measurement-only（不接 e2e、不承诺生产语义）⇒ **加入探针不 bump**（`f3_floor` 先例；
+> `bw_probe` 当年 bump 属可回溯的历史差异）。若评审要求一律 bump，改一行即可。
 
 ## 1. 三个算子一览
 

@@ -80,6 +80,17 @@ std::tuple<at::Tensor, at::Tensor> f3_gateup_epilogue(const at::Tensor &a, const
                                                      const c10::optional<at::Tensor> &out_d,
                                                      int64_t mode);
 
+// fia_grain_floor: MEASUREMENT-ONLY copy of fa_fp32_stage1 (see
+// ops/fia_grain_floor/design.md) used to sweep the KV搬运粒度 (blockStackNum,
+// source-local define B1_GRAIN_STACK_NUM). Same signature and semantics as
+// fa_fp32_stage1: returns (out fp32 [T, H, D], lse fp32 [T*H*8]). Not wired into
+// any e2e path and not part of any plugin bundle.
+std::tuple<at::Tensor, at::Tensor> fia_grain_floor(const at::Tensor &query, const at::Tensor &key,
+                                                   const at::Tensor &value, const at::Tensor &block_table,
+                                                   const at::Tensor &actual_q_seqlens,
+                                                   const at::Tensor &actual_kv_seqlens,
+                                                   int64_t q_seqlen_value = 0);
+
 } // namespace ascend_kernel
 
 #endif // OPS_H

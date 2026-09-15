@@ -29,6 +29,10 @@ TORCH_LIBRARY_FRAGMENT(npu, m)
     m.def("bw_probe(Tensor x1, Tensor x2, int variant, float eps) -> (Tensor, Tensor)");
     m.def("f3_gateup_epilogue(Tensor a, Tensor b, Tensor? workspace, Tensor? out_d, int mode) "
           "-> (Tensor, Tensor)");
+    // Measurement-only KV搬运粒度 ladder (copy of fa_fp32_stage1; see
+    // csrc/ops/fia_grain_floor/design.md).
+    m.def("fia_grain_floor(Tensor query, Tensor key, Tensor value, Tensor block_table, "
+          "Tensor actual_q_seqlens, Tensor actual_kv_seqlens, int q_seqlen_value=0) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
@@ -38,6 +42,7 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
     m.impl("add_rms_norm_stats", TORCH_FN(ascend_kernel::add_rms_norm_stats));
     m.impl("bw_probe", TORCH_FN(ascend_kernel::bw_probe));
     m.impl("f3_gateup_epilogue", TORCH_FN(ascend_kernel::f3_gateup_epilogue));
+    m.impl("fia_grain_floor", TORCH_FN(ascend_kernel::fia_grain_floor));
 }
 
 }  // namespace

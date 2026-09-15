@@ -6,6 +6,7 @@ FILE(GLOB OP_SRCS
     ${PROJECT_OP_SRC_BASE}/ops/add_rms_norm_stats/op_host/add_rms_norm_stats.cpp
     ${PROJECT_OP_SRC_BASE}/ops/bw_probe/op_host/bw_probe.cpp
     ${PROJECT_OP_SRC_BASE}/ops/f3_floor/op_host/f3_floor.cpp
+    ${PROJECT_OP_SRC_BASE}/ops/fia_grain_floor/op_host/fia_grain_floor.cpp
     )
 
 # set the library output dir to the python dir for wheel package build
@@ -63,6 +64,20 @@ ascendc_include_directories(no_workspace_kernel_f3 PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/include
 )
 
+# fia_grain_floor: MEASUREMENT-ONLY copy of fa_fp32_stage1 (see
+# csrc/ops/fia_grain_floor/design.md) - the KV搬运粒度 (blockStackNum) ladder.
+# Same AIC/AIV mix structure as fa, so it needs the same catlass include dir.
+# B1_GRAIN_STACK_NUM stays a SOURCE-LOCAL define in the kernel source (the ladder
+# edits the source default); never a target-wide -D (same reason as CATLASS_ARCH
+# above). Own target for the same reason as the others.
+ascendc_library(no_workspace_kernel_graingfloor STATIC
+    ${PROJECT_OP_SRC_BASE}/ops/fia_grain_floor/op_kernel/kernel_fia_grain_floor.cpp
+)
+ascendc_include_directories(no_workspace_kernel_graingfloor PRIVATE
+    ${PROJECT_SOURCE_DIR}/third_party/catlass/include
+    ${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/include
+)
+
 # catlass gates its 910B (arch 2201) block/epilogue templates on CATLASS_ARCH.
 # The macro is defined source-locally in kernel_fa_fp32_stage1.cpp (NOT target-
 # wide: a target-wide -D leaked into the lse_merge compile and broke its fp32
@@ -102,6 +117,7 @@ target_link_libraries(${OP_PLUGIN_NAME} PRIVATE
         no_workspace_kernel_norm
         no_workspace_kernel_bwprobe
         no_workspace_kernel_f3
+        no_workspace_kernel_graingfloor
         torch_npu
         ascendcl
         tiling_api
