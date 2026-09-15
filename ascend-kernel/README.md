@@ -3,7 +3,7 @@
 > 本工程 = CCE（Ascend C）算子的 torch extension：**共享前缀注意力核 `fa_fp32_stage1`**（fp32-out + LSE）、
 > **LSE 空间合并核 `lse_merge`**（二者合起来实现 vLLM cascade decode 的"两段式 + 数值稳定合并"，是精度分层 Tier1 的算子底座），
 > 以及 **F2 融合的 norm 阶段核 `add_rms_norm_stats`**（AddRmsNormBias→GEMM 融合立项第一程的测量仪器 + 阶段算子，见其 design.md）。
-> wheel：`ascend_kernel-2026.9.12`（CANN 9.1.0 / torch_npu 2.13.0rc1 环境重编）；主 shape = Qwen2.5-14B（H=40/KVH=8/D=128，hidden 5120，bf16）。
+> wheel：`ascend_kernel-2026.9.16`（CANN 9.1.0 / torch_npu 2.13.0rc1 环境重编）；主 shape = Qwen2.5-14B（H=40/KVH=8/D=128，hidden 5120，bf16）。
 > **单一事实源分工**：使用方法/场景/优势 = 本 README；算子内部设计 = `csrc/ops/<op>/design.md`；验证判据与用例 = `csrc/ops/<op>/test/*-test-cases.md`。
 >
 > **三个 measurement-only 探针**（不接 e2e、不进 bundle、不在上表）：`bw_probe`（D3 访问模式天花板锚点）与
@@ -14,9 +14,15 @@
 > **只有生产默认值 4 可跑** ⇒ 该杠杆不可单变量使用；B1 线按地板核实测判 **NO-GO**，
 > 见 `csrc/ops/fia_grain_floor/design.md` 与 `profiles/qwen14b-instruct-hotspot-20260910/probe-b1-floor/REPORT-GRAIN.md`）。
 >
-> **版本号纪律（探针的例外，判断留痕）**：`config.ini` 的 bump 规则针对**生产面**变更。
-> 上述三个探针均为 measurement-only（不接 e2e、不承诺生产语义）⇒ **加入探针不 bump**（`f3_floor` 先例；
-> `bw_probe` 当年 bump 属可回溯的历史差异）。若评审要求一律 bump，改一行即可。
+> **版本号纪律（2026-09-16 订正）**：`config.ini` 已 bump 至 **2026.09.16**。
+> 本轮 bump 的触发点**不是**探针合入本身，而是**生产算子 `fa_fp32_stage1` 的源码变更**：
+> 为该核加了一条 **blockStackNum 契约守卫**（两条 `static_assert`，并把栈深从两处硬编码 `4`
+> 改为派生自 `BlockMmadQK/BlockMmadPV::UNIT_BLOCK_STACK_NUM`）——见 §fa_fp32_stage1 的
+> design.md 与 `profiles/qwen14b-instruct-hotspot-20260910/probe-b1-floor/REPORT-HANG.md`。
+> 该改动**不改变数值行为也无条件改变目标码**（重建后 `libascend_kernel.so` 与改前 **md5 逐字节相同**，
+> 实机冒烟 host wall 与改前一致），按"既有算子语义变更 → bump"的纪律记账。
+> 历史注记：此前 `f3_floor` / `bw_probe` 两个探针合入时**未 bump**（`bw_probe` 当年 bump 过），
+> 本条纪律自此统一为"生产面源码变更即 bump"。
 
 ## 1. 三个算子一览
 
@@ -63,6 +69,13 @@ out, lse = torch.ops.npu.fa_fp32_stage1(
   - `q_seqlen_value=0`（默认 legacy）：允许每请求不同 q_len（T=Σq_seqlens 摊平），op_host 两次 D2H 拉 seqlen——泛化/测试用，**不可图捕获**。
   - 变长 kv：两形态都支持（kv seqlen 留在 device，kernel 按 `ceil(kv/128)` 读块；`block_table` 的 cols 是容量上界契约）。
 - **硬约束**（op_host TORCH_CHECK）：D==128、blockSize==128、H % KVH == 0、全部输入连续、q_seqlen_value<0 拒。
+- **内部契约守卫（2026-09-16 新增，编译期）**：本核的 KV 栈深与 catlass FAI 模板的硬编码几何必须相等——
+  `blockStackNum == QK::UNIT_BLOCK_STACK_NUM == PV::UNIT_BLOCK_STACK_NUM == KV_BASE_BLOCK / 128`（当前 = 4），
+  且 kernel 的 S/P layout stride 必须与模板内写死的 512 一致。该等式**此前无任何守卫**（host 不校验栈深、
+  模板无 `static_assert`），两侧各写一个 4、恰好对齐所以生产可跑；**改任一侧即静默失败**
+  （更小值死锁、更大值 S 越界/非法 AIV 访问）。现已把栈深**派生自模板常量**并加两条 `static_assert`，
+  使单侧改动**编译期报错**而非挂死设备。实测反证：故意令页大小常量违反契约 → 构建失败（RC=2，报错指向
+  `REPORT-HANG.md`）。根因分析与复现：`profiles/qwen14b-instruct-hotspot-20260910/probe-b1-floor/REPORT-HANG.md`。
 
 ### 2.3 `lse_merge`（LSE 空间合并）
 
@@ -218,6 +231,7 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | 红线 | 后果 |
 |---|---|
 | D≠128 或 blockSize≠128 | TORCH_CHECK 拒（L1TileShape 硬约束） |
+| `fa_fp32_stage1` **KV 栈深与 catlass FAI 模板几何不一致**（`UNIT_BLOCK_STACK_NUM` / `KV_BASE_BLOCK` / S stride 三处硬编码 4·512） | 此前**静默失败**：更小值死锁、更大值 S 越界（非法 AIV 访问）。**2026-09-16 已加编译期守卫**（栈深派生自模板常量 + 两条 `static_assert`）⇒ 单侧改动现在**编译失败**。根因与复现：`probe-b1-floor/REPORT-HANG.md`；实测 1/2/8 挂死、16 aicore exception、4 唯一可跑 |
 | 摊平形态子块行数 >32（T≥17 @group=5） | 已修复的 LSE staging 竞态历史缺陷；判据与回归见 design.md §11，升级改动后必跑 `test_lse_flatten_regression.py` |
 | 图捕获内 D2H/同步拷贝 | capture 拒绝（107027/107030）——本 op 的 v4 暂存区（pinned+non_blocking+内容去重）已内建，自写 op 引以为鉴：**进程级 registry 严禁持有需析构的 at::Tensor**（退出 GIL abort） |
 | CANN FIA v2（stage-2 搭档）的 TND 均匀变长+无 mask 角落 | **探针输入口径错误**：`actual_seq_kvlen` 传累计值 → 请求 r 从自身块表行起读 cum[r] 个 KV → 行越界读 → 垃圾块号 → MTE DDR 越界 0x800000 或静默 NaN（2026-09-08 定案，非布局限制、非算子缺陷；正确口径下 TND sm0 与 sm3 同测全 PASS，bug report 草稿在 `knowledge/evidence/c3-legacy/probes/`）；生产形态（ragged+mask）与 BNSD 形态均安全；**任何 FIA 计时前先同数据对拍正确性，存活≠正确** |

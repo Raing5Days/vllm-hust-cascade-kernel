@@ -191,3 +191,54 @@ staging bank 改为**按 chunk 连续交替**：成员计数 `lseStageSeq`，每
 1. **M-B/S1 锚点/30-30/fast 套件对该缺陷「互盲」的真因** = 全部用例子块行 ≤32（单 chunk），非「同 scramble 互盲」。
 2. **C1 3B「3 发散臂（0,1,4）」与 LSE 缺陷无关**：3B eager T=8 摊平子块行=32（单 chunk），LSE 修复前后均正确；修复后复跑 fp32-vs-Tier0 仍为同 3 臂 [0,1,4] → 定性为 stage-2/merge bf16 常规效应（原「fp32 生效证据」改判）。
 3. **M-B merge probe 0.069-vs-w2 0.059 的 +17% 不是置换偏置**：该 probe stage-1 为 per-request 形态（子块行 2，单 chunk，从未被污染）；修复后复跑仍 0.069，且新增摊平形态 merge probe（`cascade-c3-results/probes/p2_merge_probe_flat.py`）与 per-request 臂 **merged abs 逐 bit 相等（8.629e-05）**、抑制因子同为 0.069。+17% 为理论 w2（均匀扩散假设）的 realized-w2 方差，非偏置。
+
+## 12. blockStackNum 契约守卫（2026-09-16）
+
+> **缘起**：B1 地板核实验扫 KV 栈深时发现 1/2/8 **挂死**、16 抛 **aicore exception**，只有生产值 4 可跑；
+> 根因定位（零卡静态分析）见 `profiles/qwen14b-instruct-hotspot-20260910/probe-b1-floor/REPORT-HANG.md`。
+
+### 12.1 被守卫的契约
+
+本核的 KV 栈深同时充当三件事，且**必须**与 catlass FAI 模板的硬编码几何相等：
+
+```
+blockStackNum (kernel：两处，原各写 4)
+  ≡ BlockMmadQK::UNIT_BLOCK_STACK_NUM   (模板，public static constexpr = 4，8 个模板文件一致)
+  ≡ BlockMmadPV::UNIT_BLOCK_STACK_NUM   (模板，同上)
+  ≡ KV_BASE_BLOCK / pagedBlockSize      (512 / 128 = 4)
+  ≡ 模板内 S stride 字面量 512 / 128     (block_mmad_fai_*_normal.hpp，非参数)
+```
+
+kernel 侧另把它用作 S/P layout stride（`stackSeqTilePad = blockStackNum × pagedBlockSize`）。
+
+### 12.2 为什么必须守卫（原状：静默失败）
+
+- 模板的 `operator()` 一次**固定吃 `UNIT_BLOCK_STACK_NUM` 块**（`block_mmad_fai_qk_normal.hpp:190`），
+  而 kernel 以为只推进 `blockStackNum` 块；
+- 二者不等时：**更小值** ⇒ 记账/跨核 flag/L1 双缓冲预取配对失衡 ⇒ **死锁**；
+  **更大值** ⇒ S 布局错位 + **workspace 越界**（`128 × N×128` 元素 vs op_host 每 slot 131072）
+  ⇒ N=8 恰好顶格、N=16 需 2.0× slot ⇒ 挂死 / 非法 AIV 访问；
+- **原本无任何守卫**：op_host 的 `TORCH_CHECK` 不校验栈深、模板无 `static_assert`，
+  且 `kernel_common.hpp` 里那份 `UNIT_BLOCK_STACK_NUM` **定义了但从未被引用**。
+
+### 12.3 处置（编译期，零运行时开销）
+
+| 改动 | 位置 |
+|---|---|
+| 栈深改为**派生**模板常量（消除两处独立硬编码） | `kernel_fa_fp32_stage1.cpp` AIC/AIV 两处 `blockStackNum = BlockMmad{QK,PV}::UNIT_BLOCK_STACK_NUM` |
+| `kPagedBlockSize = 128` 常量 + 两条 `static_assert`（QK/PV 一致；栈深×页大小 == `KV_BASE_BLOCK`） | `kernel_fa_fp32_stage1.cpp` 的 `FAInferKernel` 类头 |
+| 删除 `kernel_common.hpp` 的死常量，改为指向本节的注释 | `kernel_common.hpp` |
+| 副本同步同样两条断言（断言只约束模板侧，**不妨碍**副本扫 STACKN） | `fia_grain_floor/op_kernel/kernel_fia_grain_floor.cpp` |
+
+### 12.4 验证（两条，2026-09-16）
+
+1. **零语义变更**：重建后 `libascend_kernel.so` 与改前 **md5 逐字节相同**（`7c9f22df5512a05d8fc175857bf935a6`）；
+   实机冒烟（q=2048/kv=4096/B=1/H40/KVH8/D128）host wall **1239.9 µs**（改前 1239.0/1239.9），`out` 全有限。
+2. **断言真的会拦**：故意令 `kPagedBlockSize = 64`（违反契约）⇒ 构建 **RC=2 失败**，
+   报错文本即本守卫的 `static_assert` 消息并指向 `REPORT-HANG.md`。验证后已还原。
+
+### 12.5 仍存在的边界（未覆盖，如实登记）
+
+- 模板内 **S stride 字面量 512** 与 `KV_BASE_BLOCK` 在模板里同为 512，但二者由**人工**保持一致；
+  若将来只改 S stride 而不改 `KV_BASE_BLOCK`，本守卫**察觉不到**（模板只读，无法断言其内部字面量）。
+- 断言①（QK/PV 一致）在当前模板下无法本地证伪（需改只读依赖才会触发）。

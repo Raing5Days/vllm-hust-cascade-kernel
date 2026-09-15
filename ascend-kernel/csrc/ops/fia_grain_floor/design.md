@@ -83,3 +83,13 @@ ASCEND_RT_VISIBLE_DEVICES=6 python profiles/.../probe-b1-floor/run_grain.py 4 <o
 
 **构建注意**：必须 `rm -rf build` 全量重建（`build.sh` 已内建）；增量重建会在
 `merge_aic/aiv_obj_text` 处报 `ld.lld: … unknown file type`（本仓既有问题，见 f3_floor/design.md §7）。
+
+## 7. 与生产算子的关系（2026-09-16 更新）
+
+- 本核是 `fa_fp32_stage1` 的副本，**唯一差异** = 入口名 + `B1_GRAIN_STACK_NUM` 这个独立旋钮。
+- **生产侧已加契约守卫**（栈深派生自 catlass 模板常量 + 两条 `static_assert`，见
+  `fa_fp32_stage1/design.md` §12）⇒ 生产侧**不再**存在"硬编码 4"，也因此**无法偏离**契约。
+  本核**刻意保留独立旋钮**，正是为了把契约被破坏时的失败模式继续留在可复现范围内。
+- 本核同样带那两条断言，但它们只约束**模板侧**（恒 4×128==512），
+  因此**不妨碍**扫 `STACKN` 到 1/2/8/16（那才是本核的用途）。
+- 根因分析（为何只有 4 可跑）：`probe-b1-floor/REPORT-HANG.md`。

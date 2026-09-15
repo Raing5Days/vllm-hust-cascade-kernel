@@ -69,6 +69,43 @@ class FAInferKernel {
     using ElementOTmp = typename EpilogueRescaleO::ElementInput;
     using LayoutOTmp = typename EpilogueRescaleO::LayoutInput;
 
+    // ---------------------------------------------------------------------
+    // BlockStackNum contract guard (B1, 2026-09-16)
+    //
+    // This kernel advances its KV loop by `blockStackNum` paged blocks per
+    // iteration AND uses that same value as the S/P layout stride, while the
+    // catlass FAI block templates internally *hard-code* their own stack depth
+    // (`UNIT_BLOCK_STACK_NUM`) and the S stride (the bare literal 512 inside
+    // block_mmad_fai_*_normal.hpp).  The two sides agree only when
+    //
+    //     blockStackNum == QK::UNIT_BLOCK_STACK_NUM
+    //                   == PV::UNIT_BLOCK_STACK_NUM
+    //                   == KV_BASE_BLOCK / pagedBlockSize          (512 / 128 = 4)
+    //
+    // Neither the host op nor the templates guard this equality, so a mismatch
+    // fails *silently* on device: a smaller value deadlocks (the template still
+    // eats UNIT_BLOCK_STACK_NUM blocks while the kernel counts only blockStackNum
+    // of them, so the cross-core flag / L1 ping-pong pairing desynchronises), a
+    // larger one corrupts the S layout and overflows its workspace slot (128 *
+    // N*128 elements vs 131072 per slot in op_host).  Observed 1/2/8 -> hang,
+    // 16 -> illegal AIV access, 4 -> the only working value.
+    // Root-cause write-up: profiles/qwen14b-instruct-hotspot-20260910/
+    //                     probe-b1-floor/REPORT-HANG.md
+    //
+    // The kernel now *derives* blockStackNum from the template constants instead
+    // of re-hard-coding it, and the equalities below are pinned at compile time,
+    // so any single-side edit fails the build instead of hanging the device.
+    // ---------------------------------------------------------------------
+    static constexpr uint32_t kPagedBlockSize = 128;
+    static_assert(BlockMmadQK::UNIT_BLOCK_STACK_NUM == BlockMmadPV::UNIT_BLOCK_STACK_NUM,
+                  "fa_fp32_stage1: catlass QK and PV FAI templates disagree on "
+                  "UNIT_BLOCK_STACK_NUM; the blockStackNum/pagedBlockSize contract "
+                  "cannot be satisfied by both");
+    static_assert(BlockMmadQK::UNIT_BLOCK_STACK_NUM * kPagedBlockSize == BlockMmadQK::KV_BASE_BLOCK,
+                  "fa_fp32_stage1: UNIT_BLOCK_STACK_NUM * pagedBlockSize(128) must equal "
+                  "catlass KV_BASE_BLOCK, which is also the S stride hard-coded in the "
+                  "templates; see probe-b1-floor/REPORT-HANG.md");
+
     // Methods
     CATLASS_DEVICE
     FAInferKernel() {
@@ -220,7 +257,7 @@ class FAInferKernel {
             uint32_t maskedKvS = qSBlockSize;
             uint32_t kvSLoopNumNoMask = CeilDiv(noMaskKvS, pagedBlockSize);
             uint32_t kvSLoopNumTotal = CeilDiv(noSkipKvS, pagedBlockSize);
-            uint32_t blockStackNum = 4;
+            uint32_t blockStackNum = BlockMmadQK::UNIT_BLOCK_STACK_NUM;  // contract-guarded; see class head
             uint32_t stackSeqTile;
             uint32_t stackSeqTileRound = blockStackNum * 128;
             int32_t preLaunch = 2;
@@ -530,7 +567,7 @@ class FAInferKernel {
             uint32_t maskedKvS = qSBlockSize;
             uint32_t kvSLoopNumTotal = CeilDiv(noSkipKvS, pagedBlockSize);
             uint32_t kvSLoopNumNoMask = CeilDiv(noMaskKvS, pagedBlockSize);
-            uint32_t blockStackNum = 4;
+            uint32_t blockStackNum = BlockMmadPV::UNIT_BLOCK_STACK_NUM;  // contract-guarded; see class head
             uint32_t stackSeqTilePad = blockStackNum * pagedBlockSize;
             uint32_t stackSeqTile;
             int32_t preLaunch = 2;

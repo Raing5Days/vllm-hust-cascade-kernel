@@ -20,14 +20,20 @@
 // The kernel body is byte-identical to fa_fp32_stage1 except:
 //   - the entry points are renamed (fa_fp32_stage1 -> fia_grain_floor);
 //   - `blockStackNum` is sourced from the source-local define B1_GRAIN_STACK_NUM
-//     (below) instead of the hard-coded 4, so the ladder build can sweep it.
+//     (below) instead of the production form, so the ladder build can sweep it
+//     *off-contract*.  The production op derives that value from
+//     BlockMmadQK/BlockMmadPV::UNIT_BLOCK_STACK_NUM and pins the contract with
+//     static_assert; this copy deliberately keeps an independent knob so the
+//     failure modes on each side of 4 stay reproducible (see REPORT-HANG.md).
 // B1_GRAIN_STACK_NUM is a SOURCE-LOCAL define (like CATLASS_ARCH): never a
 // target-wide -D, which would leak into other translation units of the same
 // target (precedent: kernel_fa_fp32_stage1.cpp header note / docs/multi-operator-dev.md 1.2).
 // ============================================================================
 
 // Grain knob: KV page-stack depth (number of paged blocks per K/V chunk).
-// Swept by profiles/.../probe-b1-floor/grain_ladder.sh; default 4 == production.
+// Swept by profiles/.../probe-b1-floor/grain_ladder.sh; default 4 == the value
+// the production op derives from the catlass FAI templates (and the only value
+// that satisfies their hard-coded geometry — see REPORT-HANG.md).
 #ifndef B1_GRAIN_STACK_NUM
 #define B1_GRAIN_STACK_NUM 4
 #endif
@@ -94,6 +100,28 @@ class FAInferKernel {
 
     using ElementOTmp = typename EpilogueRescaleO::ElementInput;
     using LayoutOTmp = typename EpilogueRescaleO::LayoutInput;
+
+    // ---------------------------------------------------------------------
+    // BlockStackNum contract guard — same two assertions as the production op
+    // fa_fp32_stage1 (see its class head for the full write-up, and
+    // probe-b1-floor/REPORT-HANG.md for the root-cause analysis).
+    //
+    // NOTE for this measurement copy: these assertions check the *template*
+    // side of the contract, which is fixed at 4.  They therefore fire only when
+    // the catlass templates themselves change, and they do NOT constrain the
+    // STACKN knob this copy exists to sweep — sweeping STACKN is precisely the
+    // point (1/2 deadlock, 8 deadlock, 16 illegal AIV access, 4 is the only
+    // contract-satisfying value).
+    // ---------------------------------------------------------------------
+    static constexpr uint32_t kPagedBlockSize = 128;
+    static_assert(BlockMmadQK::UNIT_BLOCK_STACK_NUM == BlockMmadPV::UNIT_BLOCK_STACK_NUM,
+                  "fia_grain_floor: catlass QK and PV FAI templates disagree on "
+                  "UNIT_BLOCK_STACK_NUM; the blockStackNum/pagedBlockSize contract "
+                  "cannot be satisfied by both");
+    static_assert(BlockMmadQK::UNIT_BLOCK_STACK_NUM * kPagedBlockSize == BlockMmadQK::KV_BASE_BLOCK,
+                  "fia_grain_floor: UNIT_BLOCK_STACK_NUM * pagedBlockSize(128) must equal "
+                  "catlass KV_BASE_BLOCK, which is also the S stride hard-coded in the "
+                  "templates; see probe-b1-floor/REPORT-HANG.md");
 
     // Methods
     CATLASS_DEVICE
