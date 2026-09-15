@@ -45,6 +45,13 @@ struct FATilingData {
     uint64_t UpdateSize = 0;
     uint64_t workSpaceSize = 0;
     float scaleValue = 0.0;
+    // ---- measurement-only addition (fia_grain_floor) ----------------------
+    // Runtime override for the KV stack depth, so the grain sweep needs ONE
+    // build instead of one rebuild per value. 0 = use the compiled-in
+    // default (B1_GRAIN_STACK_NUM). Set by op_host from the env var
+    // B1_GRAIN_STACK_NUM_RT. Production fa_fp32_stage1 does NOT have this
+    // field: it derives the stack depth from the catlass template constants.
+    uint32_t stackNumOverride = 0;
 };
 
 #endif  // FAI_TILING_DATA_HPP

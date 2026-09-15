@@ -91,6 +91,7 @@
 #include "aclrtlaunch_fia_grain_floor.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <tuple>
@@ -271,6 +272,15 @@ std::tuple<at::Tensor, at::Tensor> fia_grain_floor(const at::Tensor &query, cons
     tiling.maxNumBlocksPerBatch = static_cast<uint32_t>(maxNumBlocksPerBatch);
     tiling.maskType = 0;  // NO_MASK (shared-prefix stage)
     tiling.scaleValue = static_cast<float>(1.0 / std::sqrt(1.0 * embed));
+
+    // Measurement-only: runtime KV stack depth, so the grain sweep needs one
+    // build. Unset / 0 => compiled-in default (B1_GRAIN_STACK_NUM). See
+    // design.md and probe-b1-floor/REPORT-HANG.md.
+    {
+        const char *envStack = std::getenv("B1_GRAIN_STACK_NUM_RT");
+        tiling.stackNumOverride =
+            envStack != nullptr ? static_cast<uint32_t>(std::atoi(envStack)) : 0u;
+    }
 
     const uint32_t groupSize = static_cast<uint32_t>(numHeads / kvHeads);
     uint32_t totalTaskNum = 0;

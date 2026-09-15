@@ -38,8 +38,16 @@
 ### 2.1 安装与注册
 
 ```bash
-pip install output/ascend_kernel-2026.9.12-cp312-cp312-linux_aarch64.whl --force-reinstall --no-deps
+pip install output/ascend_kernel-2026.9.16-cp312-cp312-linux_aarch64.whl --force-reinstall --no-deps
 ```
+
+> ⚠ **上面是"安装当前构建"的命令，不等于"已经装了"。** 实测（2026-09-16）：环境里**装机版仍是
+> `2026.3.9`**（`import ascend_kernel` 解析到 site-packages；其 lib md5 `ce8bf74f…`，
+> 与本仓 `output/ascend_kernel-2026.3.9-…whl` 内容一致），而仓库当前构建是 **`2026.9.16`**
+> （lib md5 `ca8de2d7…`）⇒ 二者**不同**，装机版落后若干轮源码改动。
+> 因此：**要验证本仓库源码的改动，必须显式 `PYTHONPATH=<repo>/python/ascend_kernel`**，
+> 否则测的是装机版；要换装机版请用上面的 pip 命令并随后重跑消费方（插件仓 cascade）回归。
+> 判据与踩坑记录：`profiles/qwen14b-instruct-hotspot-20260910/probe-b1-floor/raw/guard/README.md` §0。
 
 ```python
 import ascend_kernel  # import 即注册 torch.ops.npu.fa_fp32_stage1 / lse_merge / add_rms_norm_stats

@@ -285,7 +285,9 @@ class FAInferKernel {
             uint32_t maskedKvS = qSBlockSize;
             uint32_t kvSLoopNumNoMask = CeilDiv(noMaskKvS, pagedBlockSize);
             uint32_t kvSLoopNumTotal = CeilDiv(noSkipKvS, pagedBlockSize);
-            uint32_t blockStackNum = B1_GRAIN_STACK_NUM;
+            // Runtime override (measurement-only): B1_GRAIN_STACK_NUM_RT via tiling.
+            uint32_t blockStackNum =
+                (fATilingData->stackNumOverride != 0) ? fATilingData->stackNumOverride : B1_GRAIN_STACK_NUM;
             uint32_t stackSeqTile;
             uint32_t stackSeqTileRound = blockStackNum * 128;
             int32_t preLaunch = 2;
@@ -595,7 +597,9 @@ class FAInferKernel {
             uint32_t maskedKvS = qSBlockSize;
             uint32_t kvSLoopNumTotal = CeilDiv(noSkipKvS, pagedBlockSize);
             uint32_t kvSLoopNumNoMask = CeilDiv(noMaskKvS, pagedBlockSize);
-            uint32_t blockStackNum = B1_GRAIN_STACK_NUM;
+            // Runtime override (measurement-only): must match the AIC value.
+            uint32_t blockStackNum =
+                (fATilingData->stackNumOverride != 0) ? fATilingData->stackNumOverride : B1_GRAIN_STACK_NUM;
             uint32_t stackSeqTilePad = blockStackNum * pagedBlockSize;
             uint32_t stackSeqTile;
             int32_t preLaunch = 2;
