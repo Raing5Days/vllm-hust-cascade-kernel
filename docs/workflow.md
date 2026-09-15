@@ -28,7 +28,7 @@ vi  ascend-kernel/config.ini          # 语义变更必 bump 版本(单处维护
 # ② 插件库:钉版与验证
 cd /vllm-workspace/vllm-ascend-split-batch-hust
 #    pyproject.toml 的 [kernels] extra 改成新版本号
-pip install ".[kernels]" --find-links /vllm-workspace/cascade-merge-op/ascend-kernel/output
+pip install ".[kernels]" --find-links /vllm-workspace/ops/kernels/ascend-kernel/output
 python -c "import ascend_kernel, torch; assert hasattr(torch.ops.npu, 'fa_fp32_stage1')"
 pytest -q && ruff check .             # CPU 门槛
 #    NPU 冒烟:两段式 Tier1(bf16/fp32 各一轮)+ default-off 对比
