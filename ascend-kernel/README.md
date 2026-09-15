@@ -23,6 +23,28 @@
 > 实机冒烟 host wall 与改前一致），按"既有算子语义变更 → bump"的纪律记账。
 > 历史注记：此前 `f3_floor` / `bw_probe` 两个探针合入时**未 bump**（`bw_probe` 当年 bump 过），
 > 本条纪律自此统一为"生产面源码变更即 bump"。
+>
+> ### 版本 ↔ 内容对照（2026-09-16 实测，回答"现在到底有哪些版本、哪个是哪个"）
+>
+> 每个 `output/*.whl` 内 `ascend_kernel/lib/libascend_kernel.so` 的 md5（前 16 位）实测如下
+> ——**看 md5、不要只看文件名**：
+>
+> | wheel | lib md5 | 关键内容 | 备注 |
+> |---|---|---|---|
+> | `2026.3.9` | `ce8bf74f…` | `fa_fp32_stage1` + `lse_merge`（**2 个 op**） | **= 当前装机版**（`import ascend_kernel` 加载它） |
+> | `2026.9.12` | `0dd16236…` | + `add_rms_norm_stats`（F2 norm 阶段核） | F2 冻结件 |
+> | `2026.9.12.post1` | `f93822a1…` | 同上（D3 硬化：batch + pair + Newton2） | |
+> | `2026.9.13` | `7c9f22df…` | + `bw_probe`、`f3_floor`、**契约守卫** | 与"加守卫前的 lib"**逐字节相同**（守卫是纯编译期检查，不改目标码） |
+> | `2026.9.16` | `ca8de2d7…` | + `fia_grain_floor`（含栈深运行时 override） | **= 当前源码构建**（也是当前最新） |
+>
+> 装 `2026.9.16` 后 `torch.ops.npu` 会新增 3 个 op：`add_rms_norm_stats`、`bw_probe`、`fia_grain_floor`
+> （后两者是 measurement-only 探针，注册但不在任何 e2e 路径上）。
+>
+> ⚠ **同名不同内容的坑（本轮踩到，记此备忘）**：`2026.9.16` 这个**文件名被写过两次**——
+> 15:44 版（lib `7c9f22df…`，只有守卫）在后一次构建（17:18，lib `ca8de2d7…`，加了 override）时被**覆盖**。
+> 旧内容目前只能从 `2026.9.13` 轮子取回（lib 相同）。**纪律建议**：重建并覆盖同名轮子前，
+> 要么 bump 版本号、要么给文件名加后缀（本仓已有一次同类事故记录，见
+> `profiles/.../f2-kernel/D3-REPORT-phase1-立项第一程.md` §provenance 注记）。
 
 ## 1. 三个算子一览
 
