@@ -265,6 +265,6 @@ x_out, rstd, y = torch.ops.npu.add_rms_norm_stats(
 | 注册面 | `csrc/register.cpp`（torch.ops.npu schema） |
 | 构建 | `./build.sh`（CATLASS_ARCH=2201 源内 define；catlass 整树在 `third_party/catlass/include/`） |
 | 生产消费者（插件） | `vllm-ascend-split-batch-hust/src/vllm_ascend_split_batch/cascade_{plugin,graph_plugin,runner_patch,gate,gate_self}.py` |
-| 测量报告 | `knowledge/evidence/c3-legacy/probes/W0-B2-适配测量报告.md`（B2 适配）、`W1-stageB-报告.md`（融合线 NO-GO 依据） |
+| 测量报告 | `knowledge/evidence/c3-legacy/RESULTS.md 附录 A`（B2 适配）、同文件附录 B（融合线 NO-GO 依据） |
 | 知识库 | `knowledge/flashinfer-kb/02-本地对照面.md`（自研算子与 CANN FIA 事实条目） |
 | 多人协作/新算子流程 | `../docs/multi-operator-dev.md` |
