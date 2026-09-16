@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "scope": "op",
+  "artefact": "fa_fp32_stage1",
+  "applies_to": "kernel",
+  "_why": "本算子的 UB 布局不变量。不进引擎 flow（作用于 kernel 实现面，非服务启动面），供算子生成/优化阶段读取；局部层可增加或覆盖通用层条目。",
+  "forbid": {
+    "ub_offset_range_10ub_14k_to_11ub": {
+      "value": ["[10*UB+14KB, 11*UB)"],
+      "evidence": "csrc/ops/fa_fp32_stage1/design.md:112 —— dm（rescale 权重）实际写 1536B 越界至 +14K+512B，故该区间禁用"
+    }
+  },
+  "locked": {
+    "lse_slot_offset": {
+      "value": "11*UB",
+      "evidence": "csrc/ops/fa_fp32_stage1/design.md:113-115 —— LSE val 在 [11*UB, +512B)（本算子新增，仅 maskType=0 安全）；LSE staging 双缓冲紧随其后"
+    }
+  },
+  "notes": [
+    "进程级 registry 严禁持有需析构的 at::Tensor（静态 C++ tensor 析构晚于解释器 finalization → PyEval_SaveThread GIL abort；A/B 实证见 design.md:95、:154）。这条同时是 asc 侧的必查项（ascendc-sync-audit）。"
+  ]
+}
