@@ -31,11 +31,11 @@
 >
 > | wheel | lib md5 | 关键内容 | 备注 |
 > |---|---|---|---|
-> | `2026.3.9` | `ce8bf74f…` | `fa_fp32_stage1` + `lse_merge`（**2 个 op**） | **= 当前装机版**（`import ascend_kernel` 加载它） |
+> | `2026.3.9` | `ce8bf74f…` | `fa_fp32_stage1` + `lse_merge`（**2 个 op**） | 〔2026-09-19 起**不再**是装机版，见下注〕 |
 > | `2026.9.12` | `0dd16236…` | + `add_rms_norm_stats`（F2 norm 阶段核） | F2 冻结件 |
 > | `2026.9.12.post1` | `f93822a1…` | 同上（D3 硬化：batch + pair + Newton2） | |
 > | `2026.9.13` | `7c9f22df…` | + `bw_probe`、`f3_floor`、**契约守卫** | 与"加守卫前的 lib"**逐字节相同**（守卫是纯编译期检查，不改目标码） |
-> | `2026.9.16` | `ca8de2d7…` | + `fia_grain_floor`（含栈深运行时 override） | **= 当前源码构建**（也是当前最新） |
+> | `2026.9.16` | `ca8de2d7…` | + `fia_grain_floor`（含栈深运行时 override） | **= 当前装机 lib**（实测 2026-09-19：`import ascend_kernel` 加载 md5 `ca8de2d7…`；由 lse_merge 探针轮"恢复生产配置"构建覆盖安装，pip 元数据仍显示 2026.3.9——**勿以 `pip show` 版本号判断装机内容**；cascade 回归待下次 cascade 启用时顺带补验） |
 >
 > 装 `2026.9.16` 后 `torch.ops.npu` 会新增 3 个 op：`add_rms_norm_stats`、`bw_probe`、`fia_grain_floor`
 > （后两者是 measurement-only 探针，注册但不在任何 e2e 路径上）。

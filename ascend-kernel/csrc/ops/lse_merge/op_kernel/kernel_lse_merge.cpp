@@ -39,7 +39,28 @@
 
 #include "kernel_operator.h"
 
-constexpr uint32_t TILE_ROWS = 32;
+// ---------------------------------------------------------------------------
+// 测量用探针（默认值 = 生产路径，指令序列与原文逐字节相同）
+//   0 生产：行循环每行从 w1/w2/s 标量读取（96 次/tile）
+//   1 读值不依赖向量结果（保留 GetValue 指令与条数，隔离数据依赖代价）
+//   2 行权重只读第 0 行；GetValue 指令从 3*rows 降到 3（保留行循环与 Muls）
+//   3 在 2 的基础上去掉每行的 Add（向量指令数 4*rows -> 3*rows）
+//   4 行循环整段停用（测"行循环之外的结构性因素"是否支配总时长）
+//
+// ⚠️ 刻意不写 #ifndef 守卫（2026-09-18 实测教训）：本工程的构建链会把环境
+//    CXXFLAGS 吸收成 device 侧的 -D 并**长期缓存**，那样会压过本文件的默认值、
+//    令探针静默失效。不设守卫 ⇒ 一律以本文件为准；若外部再传同名宏则会直接
+//    触发 -Wmacro-redefined 报错而不是静默走偏。
+// 结果只能用于计时：1/2/3/4 的输出数值是错的，禁止进精度门。
+// 构建与校验见 prof/build_probe.sh；测量结论见
+// profiles/lse-merge-pipe-20260918/FINDINGS.md。
+// ---------------------------------------------------------------------------
+#define LSE_PROBE_ROW_SRC 0
+
+// tile 行数（独立旋钮，用于测"时长是否随 tile 数变化"；默认 32 = 生产值）
+#define LSE_PROBE_TILE_ROWS 32
+
+constexpr uint32_t TILE_ROWS = LSE_PROBE_TILE_ROWS;
 
 class LseMerge {
 public:
@@ -235,13 +256,29 @@ private:
             mergeDst = o2F32;
         }
         for (uint32_t r = 0; r < rows; r++) {
+#if LSE_PROBE_ROW_SRC == 4
+            // 行循环整段停用：只保留循环骨架，测"彻底删掉行循环的向量与标量工作"后
+            // 总时长是否变化——若也不变，则 kernel 时长由行循环之外的结构性因素支配。
+            break;
+#elif LSE_PROBE_ROW_SRC == 1
+            float w1 = 0.5f;
+            float w2 = 0.5f;
+            float sInv = 1.0f / sLocal.GetValue(r);
+#elif LSE_PROBE_ROW_SRC == 2 || LSE_PROBE_ROW_SRC == 3
+            float w1 = w1Local.GetValue(0);
+            float w2 = w2Local.GetValue(0);
+            float sInv = 1.0f / sLocal.GetValue(0);
+#else
             float w1 = w1Local.GetValue(r);
             float w2 = w2Local.GetValue(r);
             float sInv = 1.0f / sLocal.GetValue(r);
+#endif
             uint64_t off = (uint64_t)r * dim;
             AscendC::Muls(this->o1F32[off], this->o1F32[off], w1, dim);
             AscendC::Muls(o2F32[off], o2F32[off], w2, dim);
+#if LSE_PROBE_ROW_SRC != 3
             AscendC::Add(o2F32[off], this->o1F32[off], o2F32[off], dim);
+#endif
             AscendC::Muls(mergeDst[off], o2F32[off], sInv, dim);
         }
         if (this->outIsF32) {
