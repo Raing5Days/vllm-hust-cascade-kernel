@@ -105,10 +105,14 @@ function make_ascend_kernel_package()
 
     rm -rf "$CURRENT_DIR"/python/ascend_kernel/dist
     cp -v "${CURRENT_DIR}/config.ini" "${CURRENT_DIR}/python/ascend_kernel/ascend_kernel/"
+    # setup.py stages the repository LICENSE next to itself before packaging
+    # (CANN OSL 2.0 §3.3: redistribution must carry the agreement -- our .so
+    # instantiates the vendored catlass tree, see ../NOTICE).
     python3 setup.py clean --all
     python3 setup.py bdist_wheel
     mv -v "$CURRENT_DIR"/python/ascend_kernel/dist/ascend_kernel*.whl ${OUTPUT_DIR}/
     rm -rf "$CURRENT_DIR"/python/ascend_kernel/dist
+    rm -f "${CURRENT_DIR}/python/ascend_kernel/LICENSE"
     cd -
 }
 

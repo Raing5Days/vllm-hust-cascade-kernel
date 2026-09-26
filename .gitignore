@@ -15,3 +15,5 @@ ascend-kernel/extra-info/data-dump/
 
 # local packaging
 dist/
+# LICENSE staged next to setup.py at packaging time (single source: ./LICENSE)
+ascend-kernel/python/ascend_kernel/LICENSE

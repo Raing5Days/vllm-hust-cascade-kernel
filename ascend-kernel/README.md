@@ -3,7 +3,11 @@
 > 本工程 = CCE（Ascend C）算子的 torch extension：**共享前缀注意力核 `fa_fp32_stage1`**（fp32-out + LSE）、
 > **LSE 空间合并核 `lse_merge`**（二者合起来实现 vLLM cascade decode 的"两段式 + 数值稳定合并"，是精度分层 Tier1 的算子底座），
 > 以及 **F2 融合的 norm 阶段核 `add_rms_norm_stats`**（AddRmsNormBias→GEMM 融合立项第一程的测量仪器 + 阶段算子，见其 design.md）。
-> wheel：`ascend_kernel-2026.9.16`（CANN 9.1.0 / torch_npu 2.13.0rc1 环境重编）；主 shape = Qwen2.5-14B（H=40/KVH=8/D=128，hidden 5120，bf16）。
+> wheel：`ascend_kernel-2026.9.26`（CANN 9.1.0 / torch_npu 2.13.0rc1 环境重编）；主 shape = Qwen2.5-14B（H=40/KVH=8/D=128，hidden 5120，bf16）。
+> **许可**：本仓与 wheel 均按 **CANN Open Software License Agreement 2.0** 分发（`../LICENSE`，协议文本随 wheel 一起
+> 装到 `ascend-kernel-*.dist-info/licenses/LICENSE`）；理由与边界见 `../NOTICE`（简言之：`csrc` 有 40 处实例化
+> vendored 的 CANN `catlass` 模板树 ⇒ `.so` 是 CANN 开源软件的衍生件，§3.3 要求分发时随附协议）。**仅面向华为昇腾
+> AI 处理器**（实测 Atlas 910B2 / `CATLASS_ARCH=2201`）。
 > **单一事实源分工**：使用方法/场景/优势 = 本 README；算子内部设计 = `csrc/ops/<op>/design.md`；验证判据与用例 = `csrc/ops/<op>/test/*-test-cases.md`。
 >
 > **三个 measurement-only 探针**（不接 e2e、不进 bundle、不在上表）：`bw_probe`（D3 访问模式天花板锚点）与
@@ -35,10 +39,15 @@
 > | `2026.9.12` | `0dd16236…` | + `add_rms_norm_stats`（F2 norm 阶段核） | F2 冻结件 |
 > | `2026.9.12.post1` | `f93822a1…` | 同上（D3 硬化：batch + pair + Newton2） | |
 > | `2026.9.13` | `7c9f22df…` | + `bw_probe`、`f3_floor`、**契约守卫** | 与"加守卫前的 lib"**逐字节相同**（守卫是纯编译期检查，不改目标码） |
-> | `2026.9.16` | `ca8de2d7…` | + `fia_grain_floor`（含栈深运行时 override） | **= 当前装机 lib**（实测 2026-09-19：`import ascend_kernel` 加载 md5 `ca8de2d7…`；由 lse_merge 探针轮"恢复生产配置"构建覆盖安装，pip 元数据仍显示 2026.3.9——**勿以 `pip show` 版本号判断装机内容**；cascade 回归待下次 cascade 启用时顺带补验） |
+> | `2026.9.16` | `ca8de2d7…` | + `fia_grain_floor`（含栈深运行时 override） | 内容 = 当前装机 lib；**pip 元数据曾是 2026.3.9**（覆盖安装所致，2026-09-26 已由下一条修正） |
+> | `2026.9.26` | `ca8de2d7…` | 同上（**与 `2026.9.16` 的 `_C.so` / `lib*.so` 逐字节相同**，实测 md5 `add6e6951d253328` / `ca8de2d70fe0504d`） | **= 当前装机版**；仅打包元数据变更：修 `license` 字段（原误写 `BSD 3 License`）+ 随包嵌入 CANN OSL 2.0 文本 + 版本号与实际内容对齐（`pip show` 不再报 2026.3.9） |
 >
-> 装 `2026.9.16` 后 `torch.ops.npu` 会新增 3 个 op：`add_rms_norm_stats`、`bw_probe`、`fia_grain_floor`
+> 装 `2026.9.16` / `2026.9.26` 后 `torch.ops.npu` 会新增 3 个 op：`add_rms_norm_stats`、`bw_probe`、`fia_grain_floor`
 > （后两者是 measurement-only 探针，注册但不在任何 e2e 路径上）。
+>
+> **重建可复现性（2026-09-26 实测）**：CANN 9.1.0 + torch_npu 2.13.0rc1 下重跑 `./build.sh`，
+> 产出的 `_C.so` 与 `libascend_kernel.so` 与 `2026.9.16` 轮**md5 逐字节相同** ⇒ `2026.9.26` 的内容
+> 就是此前 cascade 验证过的目标码，本次只动了打包元数据与许可。
 >
 > ⚠ **同名不同内容的坑（本轮踩到，记此备忘）**：`2026.9.16` 这个**文件名被写过两次**——
 > 15:44 版（lib `7c9f22df…`，只有守卫）在后一次构建（17:18，lib `ca8de2d7…`，加了 override）时被**覆盖**。
@@ -60,13 +69,20 @@
 ### 2.1 安装与注册
 
 ```bash
-pip install output/ascend_kernel-2026.9.16-cp312-cp312-linux_aarch64.whl --force-reinstall --no-deps
+pip install output/ascend_kernel-2026.9.26-cp312-cp312-linux_aarch64.whl --force-reinstall --no-deps
 ```
 
-> ⚠ **上面是"安装当前构建"的命令，不等于"已经装了"。** 实测（2026-09-16）：环境里**装机版仍是
-> `2026.3.9`**（`import ascend_kernel` 解析到 site-packages；其 lib md5 `ce8bf74f…`，
-> 与本仓 `output/ascend_kernel-2026.3.9-…whl` 内容一致），而仓库当前构建是 **`2026.9.16`**
-> （lib md5 `ca8de2d7…`）⇒ 二者**不同**，装机版落后若干轮源码改动。
+> **分发渠道（2026-09-26 起）**：本仓不在 PyPI 上（CANN 侧无算子轮索引，且四元组一生效即需重发）；
+> 自 2026.9.26 起，wheel 作为 **GitHub Release 附件**发布：
+> <https://github.com/Raing5Days/vllm-hust-cascade-kernel/releases/tag/v2026.9.26>。
+> 消费方（插件仓）用一条命令取用：
+> `pip install "vllm-ascend-split-batch[kernels]" --find-links <release 附件目录 URL>`。
+> 装完请核对 `python -c "import hashlib,ascend_kernel,pathlib;print(hashlib.md5((pathlib.Path(ascend_kernel.__file__).parent/'lib/libascend_kernel.so').read_bytes()).hexdigest()[:16])"`
+> 是否为 `ca8de2d70fe0504d`（`2026.9.26` 的 lib 指纹），以及 `pip show ascend-kernel` 是否报 `2026.9.26`。
+
+> ⚠ **上面是"安装当前构建"的命令，不等于"已经装了"。** 装机版与仓库构建一致性的判据是
+> **lib md5**（`ca8de2d70fe0504d` = `2026.9.26`）；`pip show` 的版本号自 `2026.9.26` 起也与内容对齐，
+> 但**历史上曾长期错位**（元数据 `2026.3.9` / 内容 `ca8de2d7…`），所以判据仍以 md5 为准。
 > 因此：**要验证本仓库源码的改动，必须显式 `PYTHONPATH=<repo>/python/ascend_kernel`**，
 > 否则测的是装机版；要换装机版请用上面的 pip 命令并随后重跑消费方（插件仓 cascade）回归。
 > 判据与踩坑记录：`profiles/qwen14b-instruct-hotspot-20260910/probe-b1-floor/raw/guard/README.md` §0。

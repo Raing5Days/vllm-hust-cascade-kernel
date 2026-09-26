@@ -1,0 +1,51 @@
+# NOTICE
+
+ascend-kernel — self-developed Ascend C (CCE) operator library:
+`fa_fp32_stage1`, `lse_merge`, `add_rms_norm_stats`, plus three measurement-only
+probes (`bw_probe`, `f3_floor`, `fia_grain_floor`).
+
+## License
+
+This repository and the `ascend-kernel` wheel it produces are distributed under
+the **CANN Open Software License Agreement Version 2.0**; the full text is in
+[`LICENSE`](LICENSE).
+
+Why the whole distribution carries that license, rather than only the vendored
+part: `ascend-kernel/third_party/catlass/` is a **vendored copy of the CANN
+`catlass` include tree** (CANN OSL 2.0 — see
+`ascend-kernel/third_party/catlass/LICENSE` and the per-file headers), and the
+device code under `ascend-kernel/csrc/ops/*/op_kernel/` **instantiates that
+template tree at compile time** (40 `#include "catlass/..."` sites). The
+resulting `.so` is therefore a derivative work of CANN Open Software — the case
+CANN OSL 2.0 §2.1 permits:
+
+> …to (i) download, use, modify, integrate, and distribute the Software or its
+> derivative works for the purpose of developing software **solely for use in
+> systems with Huawei AI Processors** and/or Software…
+
+and §3.3 requires redistribution to carry the license along:
+
+> You may distribute the Software or its derivative works in any medium, whether
+> in source or executable forms, for the purpose stipulated in Section 2;
+> **provided that you provide recipients with a copy of this Agreement, and
+> retain all notices in the Software.**
+
+Both requirements are satisfied: `LICENSE` sits at the repository root and is
+embedded in the wheel, and the per-file copyright/notice headers in the vendored
+tree are untouched. The processor restriction is a license condition, not an
+endorsement — **the wheel targets Huawei Ascend AI processors only** (validated
+on Atlas 910B2 / `CATLASS_ARCH=2201`).
+
+## What is not redistributed
+
+| item | where it lives | in the wheel? |
+|---|---|---|
+| CANN runtime libraries (`libascendcl`, `libopapi`, …) | target machine's CANN install | **no** — runtime-linked |
+| torch / torch_npu libraries | target machine's Python env | **no** — runtime-linked |
+| `catlass-example-data/` (S1 anchor inputs/goldens) | this repository | **no** — repository test data |
+| model weights, prompts | never stored here | **no** |
+
+The packaging audit is mechanical: the wheel may contain only
+`ascend_kernel/_C*.so`, `ascend_kernel/lib/libascend_kernel.so`, pure-Python
+files, the dist-info metadata and the embedded `LICENSE` (see the kernel README
+"链接纪律" and `docs/multi-operator-dev.md`).
