@@ -46,6 +46,10 @@
 > 装 `2026.9.16` / `2026.9.26` 后 `torch.ops.npu` 会新增 3 个 op：`add_rms_norm_stats`、`bw_probe`、`fia_grain_floor`
 > （后两者是 measurement-only 探针，注册但不在任何 e2e 路径上）。
 >
+> **分发（2026-09-27）**：`v2026.9.27` Release 已发布（附件 = 本地 `./build.sh` 的同一份字节，
+> 上传后回环核对 sha256 与本地一致：`9737b53116522b656c05209971864aa79038952ab9970746bba9da53d286fbc5`）。
+> 可用 `pip install "ascend-kernel==2026.9.27" --find-links <Release assets 页>` 安装。
+
 > **2026-09-27 重打包（按 `docs/workflow.md` Loop B）**：`config.ini` bump `2026.09.26 → 2026.09.27`
 > （规则：禁止覆盖同名轮），仓库根执行 `./build.sh`（CANN 9.1.0 / torch_npu 2.13.0rc1），退出 0。
 > 产物判据（只看产物）：① "确实重编"= device 目标 `.o` mtime（`auto_gen_kernel_*.cpp.o`）
@@ -86,7 +90,7 @@ pip install output/ascend_kernel-2026.9.27-cp312-cp312-linux_aarch64.whl --force
 ```
 
 > **分发渠道（2026-09-26 起）**：本仓不在 PyPI 上（CANN 侧无算子轮索引，且四元组一生效即需重发）；
-> 自 2026.9.26 起，wheel 作为 **GitHub Release 附件**发布：
+> 自 2026.9.26 起，wheel 作为 **GitHub Release 附件**发布（最新 `v2026.9.27`）：
 > <https://github.com/Raing5Days/vllm-hust-cascade-kernel/releases/tag/v2026.9.26>。
 > 消费方（插件仓）用一条命令取用：
 > `pip install "vllm-ascend-split-batch[kernels]" --find-links <release 附件目录 URL>`。
