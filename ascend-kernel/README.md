@@ -3,7 +3,7 @@
 > 本工程 = CCE（Ascend C）算子的 torch extension：**共享前缀注意力核 `fa_fp32_stage1`**（fp32-out + LSE）、
 > **LSE 空间合并核 `lse_merge`**（二者合起来实现 vLLM cascade decode 的"两段式 + 数值稳定合并"，是精度分层 Tier1 的算子底座），
 > 以及 **F2 融合的 norm 阶段核 `add_rms_norm_stats`**（AddRmsNormBias→GEMM 融合立项第一程的测量仪器 + 阶段算子，见其 design.md）。
-> wheel：`ascend_kernel-2026.9.26`（CANN 9.1.0 / torch_npu 2.13.0rc1 环境重编）；主 shape = Qwen2.5-14B（H=40/KVH=8/D=128，hidden 5120，bf16）。
+> wheel：`ascend_kernel-2026.9.27`（CANN 9.1.0 / torch_npu 2.13.0rc1 环境重编；与 2026.9.26 目标码逐字节相同）；主 shape = Qwen2.5-14B（H=40/KVH=8/D=128，hidden 5120，bf16）。
 > **许可**：本仓与 wheel 均按 **CANN Open Software License Agreement 2.0** 分发（`../LICENSE`，协议文本随 wheel 一起
 > 装到 `ascend-kernel-*.dist-info/licenses/LICENSE`）；理由与边界见 `../NOTICE`（简言之：`csrc` 有 40 处实例化
 > vendored 的 CANN `catlass` 模板树 ⇒ `.so` 是 CANN 开源软件的衍生件，§3.3 要求分发时随附协议）。**仅面向华为昇腾
@@ -40,11 +40,24 @@
 > | `2026.9.12.post1` | `f93822a1…` | 同上（D3 硬化：batch + pair + Newton2） | |
 > | `2026.9.13` | `7c9f22df…` | + `bw_probe`、`f3_floor`、**契约守卫** | 与"加守卫前的 lib"**逐字节相同**（守卫是纯编译期检查，不改目标码） |
 > | `2026.9.16` | `ca8de2d7…` | + `fia_grain_floor`（含栈深运行时 override） | 内容 = 当前装机 lib；**pip 元数据曾是 2026.3.9**（覆盖安装所致，2026-09-26 已由下一条修正） |
-> | `2026.9.26` | `ca8de2d7…` | 同上（**与 `2026.9.16` 的 `_C.so` / `lib*.so` 逐字节相同**，实测 md5 `add6e6951d253328` / `ca8de2d70fe0504d`） | **= 当前装机版**；仅打包元数据变更：修 `license` 字段（原误写 `BSD 3 License`）+ 随包嵌入 CANN OSL 2.0 文本 + 版本号与实际内容对齐（`pip show` 不再报 2026.3.9） |
+> | `2026.9.26` | `ca8de2d7…` | 同上（**与 `2026.9.16` 的 `_C.so` / `lib*.so` 逐字节相同**，实测 md5 `add6e6951d253328` / `ca8de2d70fe0504d`） | 仅打包元数据变更：修 `license` 字段（原误写 `BSD 3 License`）+ 随包嵌入 CANN OSL 2.0 文本 + 版本号与实际内容对齐（`pip show` 不再报 2026.3.9） |
+> | `2026.9.27` | `ca8de2d7…` | **同 `2026.9.26`（两个 `.so` 逐字节相同）** | **= 当前装机版**（2026-09-27 按历史打包规则（`docs/workflow.md` Loop B）重打包：`config.ini` bump，产物等价性实测通过） |
 >
 > 装 `2026.9.16` / `2026.9.26` 后 `torch.ops.npu` 会新增 3 个 op：`add_rms_norm_stats`、`bw_probe`、`fia_grain_floor`
 > （后两者是 measurement-only 探针，注册但不在任何 e2e 路径上）。
 >
+> **2026-09-27 重打包（按 `docs/workflow.md` Loop B）**：`config.ini` bump `2026.09.26 → 2026.09.27`
+> （规则：禁止覆盖同名轮），仓库根执行 `./build.sh`（CANN 9.1.0 / torch_npu 2.13.0rc1），退出 0。
+> 产物判据（只看产物）：① "确实重编"= device 目标 `.o` mtime（`auto_gen_kernel_*.cpp.o`）
+> 不低于最新源码 mtime —— 通过；② 等价性 = `_C.so` md5 `add6e6951d253328…`、`libascend_kernel.so`
+> md5 `ca8de2d70fe0504d…`，与 `2026.9.26`/`2026.9.16` **逐字节相同** ⇒ 仅版本元数据变化
+> （注意：这里"同一 md5"是**预期**，与 AGENTS.md「同一 md5 出现两次 = 警报」所指的
+> "不同配置产出同一二进制" 不是一回事 —— 后者是配置没进去，前者是源码没变）；③ wheel 内
+> `Version: 2026.9.27`、`License: CANN OSL 2.0`、`License-File: LICENSE` 且协议文本 5274 字符；
+> ④ 安装冒烟：`pip show` 报 `2026.9.27`，`fa_fp32_stage1` / `lse_merge` / `add_rms_norm_stats`
+> 三 op 与两个 measurement-only 探针全部注册。`output/dist.sha256` =
+> `9737b53116522b656c05209971864aa79038952ab9970746bba9da53d286fbc5`。
+
 > **重建可复现性（2026-09-26 实测）**：CANN 9.1.0 + torch_npu 2.13.0rc1 下重跑 `./build.sh`，
 > 产出的 `_C.so` 与 `libascend_kernel.so` 与 `2026.9.16` 轮**md5 逐字节相同** ⇒ `2026.9.26` 的内容
 > 就是此前 cascade 验证过的目标码，本次只动了打包元数据与许可。
@@ -69,7 +82,7 @@
 ### 2.1 安装与注册
 
 ```bash
-pip install output/ascend_kernel-2026.9.26-cp312-cp312-linux_aarch64.whl --force-reinstall --no-deps
+pip install output/ascend_kernel-2026.9.27-cp312-cp312-linux_aarch64.whl --force-reinstall --no-deps
 ```
 
 > **分发渠道（2026-09-26 起）**：本仓不在 PyPI 上（CANN 侧无算子轮索引，且四元组一生效即需重发）；
