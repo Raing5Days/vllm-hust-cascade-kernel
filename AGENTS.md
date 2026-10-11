@@ -49,6 +49,18 @@
 
 自动化护栏见 `ascend-kernel/csrc/ops/lse_merge/prof/build_probe.sh`（含上述校验）。
 
+6. **wheel 有 glibc 底座约束（2026-10-11 实测，切镜像日）**：现有产物（v2026.9.26 /
+   v2026.9.27）按旧底座（glibc ≥2.38）构建，`libascend_kernel.so` 需 `GLIBC_2.38`——
+   在 0.28 新镜像底座（Ubuntu 22.04.5 / glibc 2.35）`import ascend_kernel` 直接
+   `OSError`（官方 release 字节 sha256 核对一致后复测仍复现，排除脏装）。**处置
+   （用户裁定 2026-10-11）**：0.28 主栈暂不启用 cascade——新模型（Qwen3.5-35B-A3B）
+   + TP=2 负载下本算子无需加载，插件 fail-open 降级 full-KV；按历史归档。**重启用
+   条件**：Ubuntu 22.04 底座重建 wheel（CANN 9.1.0 工具链在位，SOC_VERSION=
+   ascend910b2）→ 重跑插件仓 `test_cascade_fail_open.py` + `test_cascade_plugin.py`
+   （5 个环境红灯转绿）→ 插件 `kernels` extra 与本仓版本对齐（插件现钉 2026.9.26）。
+   完整归档：插件仓 `docs/evidence/host-028-2026-10-11.md` §4 与验证容器
+   records/s0-checkpoint-20261011.md §11。
+
 ### 测量前先自检仪器（2026-09-19 追加，血的教训）
 
 上面 1–4 条的共同表象是**"不同输入产出同一个二进制"**，而这类错误**不会自己报警**：
